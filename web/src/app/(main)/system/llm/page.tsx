@@ -57,11 +57,34 @@ const MAX_TOKENS_FIELD_HINTS: Record<string, string> = {
   anthropic: "Only selectable for the openai format. Anthropic's field name is fixed as max_tokens.",
   "openai-responses": "Only selectable for the openai format. The Responses API's field name is fixed as max_output_tokens.",
   ollama: "Only selectable for the openai format. Ollama's field name is fixed as max_tokens.",
+  "claude-cli": "Only selectable for the openai format. Ignored by local Claude Code CLI.",
+  "agy-cli": "Only selectable for the openai format. Ignored by local Antigravity CLI (agy).",
 };
-// LLM profile formats. The default in the create form is "anthropic"; "ollama" is the
-// keyless local-server format (base URL defaults to http://127.0.0.1:11434/v1).
-type ProfileFormat = "anthropic" | "openai" | "openai-responses" | "ollama";
+// LLM profile formats. The default in the create form is "anthropic"; "ollama", "claude-cli",
+// and "agy-cli" are keyless local backends (Ollama defaults to http://127.0.0.1:11434/v1;
+// CLI formats look up their binary on PATH unless Base URL overrides the binary path).
+type ProfileFormat = "anthropic" | "openai" | "openai-responses" | "ollama" | "claude-cli" | "agy-cli";
+const VALID_FORMATS = new Set<ProfileFormat>(["anthropic", "openai", "openai-responses", "ollama", "claude-cli", "agy-cli"]);
+const KEYLESS_FORMATS = new Set<ProfileFormat>(["ollama", "claude-cli", "agy-cli"]);
+const isKeylessFormat = (f?: string): boolean => !!f && KEYLESS_FORMATS.has(f as ProfileFormat);
+const isCLIFormat = (f?: string): boolean => f === "claude-cli" || f === "agy-cli";
 const OLLAMA_DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1";
+const MODEL_PLACEHOLDERS: Record<ProfileFormat, string> = {
+  anthropic: "claude-opus-4-8",
+  openai: "claude-opus-4-8",
+  "openai-responses": "claude-opus-4-8",
+  ollama: "llama3.2",
+  "claude-cli": "sonnet",
+  "agy-cli": "gemini-4-hydrogen-high",
+};
+const BASE_URL_PLACEHOLDERS: Record<ProfileFormat, string> = {
+  anthropic: "https://api.openai.com/v1",
+  openai: "https://api.openai.com/v1",
+  "openai-responses": "https://api.openai.com/v1",
+  ollama: OLLAMA_DEFAULT_BASE_URL,
+  "claude-cli": "Optional custom claude binary path (empty = lookup on PATH)",
+  "agy-cli": "Optional custom agy binary path (empty = lookup on PATH)",
+};
 const EFFORT_LEVELS: { value: string; label: string }[] = [
   { value: NONE, label: "Not sent (default)" },
   { value: "low", label: "low" },
@@ -78,11 +101,11 @@ function cooldownText(secs: number) {
 }
 
 // The "healthy or not" badge a profile shows on its card. A profile without a Key cannot send any request at all — say that before the breaker;
-// the exception is Ollama, a keyless local server that IS callable without a key. The other states come from the pool's breaker
+// the exceptions are keyless local backends (Ollama and local CLI runners), which ARE callable without a key. The other states come from the pool's breaker
 // records (with polling off no new records appear, so "healthy" = no known failure).
 type Health = { label: string; cls: string; hint?: string };
 function healthOf(p: LLMProfile, m?: LLMPoolMember): Health {
-  if (!p.api_key_hint && p.format !== "ollama") {
+  if (!p.api_key_hint && !isKeylessFormat(p.format)) {
     return {
       label: "No Key configured",
       cls: "border-muted-foreground/40 text-muted-foreground",
@@ -222,7 +245,7 @@ function PoolSheet({
                 </div>
                 {inChain.length < 2 && (
                   <p className="text-muted-foreground text-xs">
-                    Only {inChain.length} usable profile(s) right now, so the pool has no effect — at least 2 usable profiles (API Key set, or Ollama) with pool participation are
+                    Only {inChain.length} usable profile(s) right now, so the pool has no effect — at least 2 usable profiles (API Key set, or keyless local Ollama / CLI) with pool participation are
                     required.
                   </p>
                 )}
@@ -349,11 +372,7 @@ function ProfileSheet({
   React.useEffect(() => {
     if (!open) return;
     setName(profile?.name ?? "");
-    setFormat(
-      profile?.format === "openai" || profile?.format === "openai-responses" || profile?.format === "ollama"
-        ? profile.format
-        : "anthropic",
-    );
+    setFormat(profile?.format && VALID_FORMATS.has(profile.format as ProfileFormat) ? (profile.format as ProfileFormat) : "anthropic");
     setModel(profile?.model ?? "");
     setBaseUrl(profile?.base_url ?? "");
     setProxy(profile?.proxy ?? "");
@@ -476,6 +495,8 @@ function ProfileSheet({
   let keyPlaceholder = "sk-…";
   if (format === "ollama") {
     keyPlaceholder = "optional — a local Ollama server runs keyless";
+  } else if (isCLIFormat(format)) {
+    keyPlaceholder = "optional — local CLI uses its own auth";
   } else if (keyHint) {
     keyPlaceholder = `Set (${keyHint}); leave empty to keep it`;
   }
@@ -524,6 +545,8 @@ function ProfileSheet({
                   <SelectItem value="openai">OpenAI (Chat Completions)</SelectItem>
                   <SelectItem value="openai-responses">OpenAI (Responses API)</SelectItem>
                   <SelectItem value="ollama">Ollama (local, no key needed)</SelectItem>
+                  <SelectItem value="claude-cli">Claude Code CLI (local, no key needed)</SelectItem>
+                  <SelectItem value="agy-cli">Antigravity CLI — agy (local, no key needed)</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -535,7 +558,7 @@ function ProfileSheet({
               <Input
                 id="p-model"
                 className="font-mono"
-                placeholder={format === "ollama" ? "llama3.2" : "claude-opus-4-8"}
+                placeholder={MODEL_PLACEHOLDERS[format]}
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
               />
@@ -577,11 +600,13 @@ function ProfileSheet({
           </div>
 
           <div className="grid gap-2">
-            <Label htmlFor="p-base-url">Base URL (optional)</Label>
+            <Label htmlFor="p-base-url">
+              {isCLIFormat(format) ? "CLI binary path override (optional)" : "Base URL (optional)"}
+            </Label>
             <Input
               id="p-base-url"
               className="font-mono"
-              placeholder={format === "ollama" ? OLLAMA_DEFAULT_BASE_URL : "https://api.openai.com/v1"}
+              placeholder={BASE_URL_PLACEHOLDERS[format]}
               value={baseUrl}
               onChange={(e) => setBaseUrl(e.target.value)}
             />
@@ -635,7 +660,11 @@ function ProfileSheet({
 
           <div className="grid gap-2">
             <Label htmlFor="p-api-key">
-              {format === "ollama" ? "API Key (optional for Ollama)" : "API Key"}
+              {format === "ollama"
+                ? "API Key (optional for Ollama)"
+                : isCLIFormat(format)
+                  ? "API Key (optional — local CLI uses its own auth)"
+                  : "API Key"}
             </Label>
             <Input
               id="p-api-key"
