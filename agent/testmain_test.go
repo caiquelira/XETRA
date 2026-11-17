@@ -13,6 +13,9 @@ import (
 // agent test suite so cross-package DELETE cleanup races with db/server
 // packages are avoided when running `go test ./...`.
 func TestMain(m *testing.M) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") == "1" {
+		os.Exit(m.Run())
+	}
 	// Own database per package (#80): with separate databases, packages stop
 	// contending on shared tables and the advisory lock below stops
 	// serializing go test ./... across packages.
