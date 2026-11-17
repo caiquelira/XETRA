@@ -1,11 +1,16 @@
 package server
 
 import (
+	"context"
 	"database/sql"
+	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 	"testing"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/mcpbridge"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -13,6 +18,15 @@ import (
 // server test suite so cross-package DELETE cleanup races with db/agent
 // packages are avoided when running `go test ./...`.
 func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == "hook" {
+		sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := mcpbridge.RunHookClient(sigCtx, os.Args[2:], os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "server test hook: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	// Own database per package (#80): with separate databases, packages stop
 	// contending on shared tables and the advisory lock below stops
 	// serializing go test ./... across packages.

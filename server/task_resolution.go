@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 )
 
@@ -29,10 +30,26 @@ func (s *Server) resolutionFromProfile(p *db.LLMProfile, source string) taskLLMR
 		Model:     p.Model,
 		Source:    source,
 	}
-	// Ollama profiles are keyless by design; the other formats need a key.
-	if p.APIKey == "" && p.Format != "ollama" {
+	// Keyless profiles (Ollama, claude-cli, agy-cli) operate without an API key.
+	if p.APIKey == "" && !db.IsKeylessProfileFormat(p.Format) {
 		result.Reason = "LLM profile has no API Key set"
 		return result
+	}
+	cfg, ok := s.loadProfileConfig(p.ID)
+	if !ok {
+		result.Reason = "LLM profile format or parameters are invalid"
+		return result
+	}
+	if cfg.IsCLI() {
+		b, found := agent.LookupCLIBackend(cfg.Format)
+		if !found {
+			result.Reason = fmt.Sprintf("unknown CLI backend %q", cfg.Format)
+			return result
+		}
+		if err := b.CheckReady(cfg); err != nil {
+			result.Reason = err.Error()
+			return result
+		}
 	}
 	if _, _, ok := s.providerForProfile(p.ID); !ok {
 		result.Reason = "LLM profile format or parameters are invalid"
@@ -93,10 +110,20 @@ func (s *Server) resolveTaskRoleLLM(t *Task, agentKey string) (taskLLMResolution
 		if name == "" {
 			name = "global configuration"
 		}
-		return taskLLMResolution{
+		res := taskLLMResolution{
 			Name: name, Format: cfg.Provider(), Model: cfg.Model,
 			Source: "environment", Available: true,
-		}, nil
+		}
+		if cfg.IsCLI() {
+			if b, found := agent.LookupCLIBackend(cfg.Format); !found {
+				res.Available = false
+				res.Reason = fmt.Sprintf("unknown CLI backend %q", cfg.Format)
+			} else if err := b.CheckReady(cfg); err != nil {
+				res.Available = false
+				res.Reason = err.Error()
+			}
+		}
+		return res, nil
 	}
 	return taskLLMResolution{Source: "global", Reason: "no available LLM profile"}, nil
 }

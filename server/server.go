@@ -27,6 +27,7 @@ import (
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
+	"github.com/Autumn-27/artex/mcpbridge"
 	"github.com/Autumn-27/artex/report"
 	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/norma/llm"
@@ -130,6 +131,10 @@ type Server struct {
 	archiveWake chan struct{}
 	archiveWG   sync.WaitGroup
 	side        *sideQuestionState
+
+	bridgeMu     sync.Mutex
+	mcpBridge    *mcpbridge.Server
+	bridgeClosed bool
 }
 
 // provEntry is a cached provider + its config for one LLM profile id.
@@ -169,6 +174,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	for _, o := range opts {
 		o(s)
 	}
+	if ctx == nil || ctx.Err() == nil {
+		s.ensureMCPBridge()
+	}
 	s.initSetupToken()
 	s.initSideQuestions()
 	// Circuit-breaker thresholds/cooldowns are hot parameters on the failure path; push the global retry policy to the Registry once at startup,
@@ -184,6 +192,15 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		b := s.agentsForTask(t)
 		return b.pl, b.wk
 	})
+	s.engine.SetCLIHandlers(
+		func(callCtx context.Context, t *Task, agentKey string) any {
+			return s.beginTaskCLIAttempt(callCtx, t, agentKey)
+		},
+		func(snap any, committed bool, err error) (bool, error) {
+			st, _ := snap.(*cliAttemptSnapshot)
+			return finishCLIAttempt(st, committed, err)
+		},
+	)
 	// Global readiness (Ready()/llm_configured): a global active LLM provider is
 	// installed. Task-level runnability is separate (ReadyFor → the resolver above).
 	s.engine.SetReadiness(func() bool {
@@ -286,6 +303,56 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	return s
 }
 
+func (s *Server) usagePG() *db.DB {
+	if s == nil || s.m == nil {
+		return nil
+	}
+	return s.m.pg
+}
+
+func (s *Server) ensureMCPBridge() *mcpbridge.Server {
+	if s == nil {
+		return nil
+	}
+	s.bridgeMu.Lock()
+	defer s.bridgeMu.Unlock()
+	if s.bridgeClosed {
+		return nil
+	}
+	if s.mcpBridge == nil {
+		srv, err := mcpbridge.NewServer()
+		if err != nil {
+			log.Printf("[mcpbridge] start failed: %v", err)
+			return nil
+		}
+		s.mcpBridge = srv
+	}
+	return s.mcpBridge
+}
+
+func (s *Server) cliAgentOptions() agent.CLIAgentOptions {
+	return agent.CLIAgentOptions{
+		Bridge:  s.ensureMCPBridge(),
+		UsagePG: s.usagePG(),
+	}
+}
+
+// Close shuts down Server-owned runtime resources such as the shared mcpbridge server.
+func (s *Server) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.bridgeMu.Lock()
+	s.bridgeClosed = true
+	bridge := s.mcpBridge
+	s.mcpBridge = nil
+	s.bridgeMu.Unlock()
+	if bridge != nil {
+		return bridge.Close()
+	}
+	return nil
+}
+
 // Restored deadline and worker loops must inherit the same context as new tasks,
 // including the side-question checkpoint publisher installed during startup.
 func (s *Server) restoreTaskRuntimes() {
@@ -353,6 +420,7 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 		return agent.Config{}, false
 	}
 	cfg := agent.ConfigFrom(p.Format, p.Model, p.BaseURL, p.APIKey, p.Proxy)
+	cfg.ProfileName = p.Name
 	cfg.RatePerSecond, cfg.RatePerMinute = p.RatePerSecond, p.RatePerMinute
 	cfg.ContextWindowK = p.ContextWindowK
 	cfg.ThinkingType = p.ThinkingType
@@ -362,8 +430,8 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
 	s.applyProfileRetry(&cfg, p)
-	// Ollama profiles run keyless (local server); the other formats need a key.
-	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
+	// Keyless profiles (Ollama, claude-cli, agy-cli) run without an API key.
+	if cfg.APIKey == "" && !db.IsKeylessProfileFormat(p.Format) && cfg.NeedsAPIKey() {
 		return cfg, false
 	}
 	s.cfgMu.Lock()
@@ -507,6 +575,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	s.chatAgent.SetNonStreaming(nonStreamingResolver(cfg))
 	s.chatAgent.SetMaxTokens(maxTokensResolver(cfg))
 	s.chatAgent.SetNoaEnabled(s.m.NoaCompactionEnabled) // experimental: noa context compaction (read per run)
+	s.chatAgent.SetCLIOptions(s.cliAgentOptions())
 	s.llmProv = prov
 	s.llmCfg = cfg
 	s.llmOn = true
@@ -529,6 +598,7 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 		return agent.Config{}, false
 	}
 	cfg := agent.ConfigFrom(p.Format, p.Model, p.BaseURL, p.APIKey, p.Proxy)
+	cfg.ProfileName = p.Name
 	cfg.RatePerSecond, cfg.RatePerMinute = p.RatePerSecond, p.RatePerMinute
 	cfg.ContextWindowK = p.ContextWindowK
 	cfg.ThinkingType = p.ThinkingType
@@ -538,7 +608,7 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
 	s.applyProfileRetry(&cfg, p)
-	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
+	if cfg.APIKey == "" && !db.IsKeylessProfileFormat(p.Format) && cfg.NeedsAPIKey() {
 		return cfg, false
 	}
 	return cfg, true
@@ -596,6 +666,11 @@ func (s *Server) providerForProfile(id int64) (llm.Provider, agent.Config, bool)
 	s.provCacheMu.Lock()
 	if e := s.provByProfile[id]; e != nil {
 		s.provCacheMu.Unlock()
+		if e.cfg.IsCLI() {
+			if b, ok := agent.LookupCLIBackend(e.cfg.Format); !ok || b.CheckReady(e.cfg) != nil {
+				return nil, agent.Config{}, false
+			}
+		}
 		return e.prov, e.cfg, true
 	}
 	generation := s.provCacheGen
@@ -650,6 +725,7 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 	ca.SetNonStreaming(nonStreamingResolver(cfg))
 	ca.SetMaxTokens(maxTokensResolver(cfg))
 	ca.SetNoaEnabled(s.m.NoaCompactionEnabled) // experimental: noa context compaction (read per run)
+	ca.SetCLIOptions(s.cliAgentOptions())
 	s.profMu.Lock()
 	if ex := s.profChatAgents[id]; ex != nil { // lost the race → keep the winner
 		ca = ex
@@ -1396,6 +1472,7 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		s.cfgMu.Unlock()
 	}
 	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
+	cfg.ProfileName = "default"
 	cfg.RatePerSecond, cfg.RatePerMinute = req.RatePerSecond, req.RatePerMinute
 	cfg.ThinkingType = req.ThinkingType
 	cfg.ReasoningEffort = req.ReasoningEffort
@@ -1405,7 +1482,7 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg.ContextWindowK = k
 	}
-	// Keyless formats (Ollama) need no key; the others keep/require one.
+	// Keyless formats (Ollama, claude-cli, agy-cli) need no key; the others keep/require one.
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		s.cfgMu.Lock()
 		cfg.APIKey = s.llmCfg.APIKey // keep existing key if not re-entered
@@ -1425,10 +1502,12 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.invalidateProfileAgents()
-	if _, ok := s.loadLLMConfig(); !ok {
+	loadedCfg, ok := s.loadLLMConfig()
+	if !ok {
 		writeErr(w, 500, "saved provider is unavailable")
 		return
 	}
+	cfg = loadedCfg
 	if err := s.applyLLM(cfg); err != nil {
 		writeErr(w, 400, "provider init failed: "+err.Error())
 		return
@@ -1462,7 +1541,7 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// profile's key to the wrong host (the stored-key 401s). Fill whatever the
 	// form left empty from the row first; explicit form values still win.
 	var stored *db.LLMProfile
-	if req.ProfileID != nil {
+	if req.ProfileID != nil && s.m != nil && s.m.pg != nil {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
 			stored = p
 		}
@@ -1851,9 +1930,10 @@ func schemeForPort(p int) string {
 // llmHost returns the host of the configured LLM endpoint (to keep it out of scope).
 func (s *Server) llmHost() string {
 	s.cfgMu.Lock()
+	isCLI := s.llmCfg.IsCLI()
 	base := s.llmCfg.BaseURL
 	s.cfgMu.Unlock()
-	if base == "" {
+	if isCLI || base == "" {
 		return ""
 	}
 	if u, err := url.Parse(base); err == nil {
@@ -4115,9 +4195,29 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 				emit(a)
 			})
 			gctx = intercept.WithTargetScope(gctx, t.targetScope(intercept.DefaultTargetWaitBound))
-			s.engine.BeginLLMCall(t.ID)
-			_, err := ma.Chat(gctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, t.TargetGuard.Hooks(), emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
-			s.engine.EndLLMCall(t.ID)
+			var err error
+			const maxCLIFailovers = 16
+			for failover := 0; failover < maxCLIFailovers; failover++ {
+				snap := s.beginTaskCLIAttempt(gctx, t, "mainagent")
+				committed := false
+				turnEmit := func(rec db.Activity) {
+					if rec.Kind == "text" || rec.Kind == "tool_use" || rec.Kind == "tool_result" {
+						committed = true
+					}
+					emit(rec)
+				}
+				s.engine.BeginLLMCall(t.ID)
+				_, err = ma.Chat(gctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, t.TargetGuard.Hooks(), turnEmit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
+				s.engine.EndLLMCall(t.ID)
+				if ctx.Err() != nil {
+					break
+				}
+				retry, handledErr := finishCLIAttempt(snap, committed, err)
+				err = handledErr
+				if !retry {
+					break
+				}
+			}
 			if err != nil && ctx.Err() == nil {
 				s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "(main agent error: " + err.Error() + ")", MainSeg: segPtr})
 			}

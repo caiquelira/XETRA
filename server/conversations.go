@@ -16,7 +16,9 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/sidequestion"
+	"github.com/Autumn-27/norma/llm"
 )
 
 const (
@@ -568,7 +570,48 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 		WaitBound: intercept.DefaultTargetWaitBound, Interceptor: s.m.interceptor})
 	// On a manual stop ctx is cancelled; Chat already emits a clean "stopped by the user"
 	// step, so skip the raw-error entry — only surface genuine failures.
-	if _, err := ca.Chat(gctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, emit); err != nil {
+	var err error
+	const maxCLIFailovers = 16
+	for failover := 0; failover < maxCLIFailovers; failover++ {
+		pool := s.chatPoolForConversation(c)
+		var activeCLI *llmpool.Member
+		if pool != nil {
+			if m := pool.ActiveMember(); m != nil && agent.IsCLIFormat(llm.Format(m.Format)) {
+				activeCLI = m
+			}
+		}
+		committed := false
+		turnEmit := func(rec db.Activity) {
+			if rec.Kind == "text" || rec.Kind == "tool_use" || rec.Kind == "tool_result" {
+				committed = true
+			}
+			emit(rec)
+		}
+		_, err = ca.Chat(gctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, turnEmit)
+		if ctx.Err() != nil || activeCLI == nil {
+			break
+		}
+		h := pool.Health()
+		if err == nil {
+			if h != nil {
+				h.Pass(activeCLI.ID)
+			}
+			break
+		}
+		hard := isQuotaExhaustedError(err)
+		if h != nil {
+			if h.Trip(activeCLI.ID, trimPoolError(err), hard) {
+				log.Printf("[llmpool] chat CLI profile #%d breaker tripped: %s", activeCLI.ID, trimPoolError(err))
+			}
+		}
+		if !committed && hard {
+			if next := pool.ActiveMember(); next != nil && next.ID != activeCLI.ID {
+				continue
+			}
+		}
+		break
+	}
+	if err != nil {
 		finishReason = err.Error()
 		if ctx.Err() == nil {
 			_, _ = pg.AppendConvActivity(c.ID, db.Activity{Worker: c.AgentKey, Kind: "text", IsError: true,
@@ -611,12 +654,36 @@ func (s *Server) readTriggerBehavior(agentKey string) triggerBehavior {
 	return b
 }
 
+func (s *Server) chatPoolForConversation(c *db.Conversation) *llmpool.Pool {
+	if s == nil || s.m == nil || s.m.pg == nil || !s.m.LLMPoolEnabled() {
+		return nil
+	}
+	if c != nil {
+		if eff := s.effectiveProfileForAgent(c.AgentKey, c.LLMProfileID); eff != nil {
+			if !s.m.LLMPoolBindFallback() {
+				return nil
+			}
+			prov, cfg, ok := s.providerForProfile(*eff)
+			if !ok {
+				return nil
+			}
+			p, _ := s.poolForBinding(*eff, prov, cfg).(*llmpool.Pool)
+			return p
+		}
+	}
+	s.cfgMu.Lock()
+	prov := s.llmProv
+	s.cfgMu.Unlock()
+	p, _ := prov.(*llmpool.Pool)
+	return p
+}
+
 // StartTriggeredRun enqueues a P3 trigger fire for agentKey and pumps the queue. The
 // agent's policy decides concurrency + merge: serial → run one at a time (optionally
 // merging by task / all / none); parallel → run each fire in its own concurrent
 // conversation up to trigger_max_parallel. Distinct agents always run concurrently.
 func (s *Server) StartTriggeredRun(agentKey, title, message string, taskID int64, mergeable bool, taskDesc, taskGoal string) {
-	if s.m.pg == nil || s.chatAgentRef() == nil {
+	if s.m.pg == nil || s.resolveChatAgent(&db.Conversation{AgentKey: agentKey}) == nil {
 		return
 	}
 	cfg := s.readTriggerBehavior(agentKey) // DB read BEFORE the lock (never under queueMu)

@@ -24,4 +24,5 @@ func stopTestServer(t *testing.T, s *Server, cancel context.CancelFunc) {
 	}
 	s.archiveWG.Wait()
 	<-s.side.done
+	_ = s.Close()
 }

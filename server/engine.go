@@ -158,6 +158,30 @@ type Engine struct {
 	// readiness reports whether a global LLM provider is configured — the signal behind
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
 	readiness func() bool
+
+	cliBegin  func(ctx context.Context, t *Task, agentKey string) any
+	cliFinish func(snap any, committed bool, err error) (bool, error)
+}
+
+// SetCLIHandlers wires server-level CLI attempt lifecycle callbacks for task
+// failover chains and llmpool health tracking across headless CLI executions.
+func (e *Engine) SetCLIHandlers(begin func(context.Context, *Task, string) any, finish func(any, bool, error) (bool, error)) {
+	e.cliBegin = begin
+	e.cliFinish = finish
+}
+
+func (e *Engine) beginCLIAttempt(ctx context.Context, t *Task, agentKey string) any {
+	if e == nil || e.cliBegin == nil {
+		return nil
+	}
+	return e.cliBegin(ctx, t, agentKey)
+}
+
+func (e *Engine) finishCLIAttempt(snap any, committed bool, err error) (bool, error) {
+	if e == nil || e.cliFinish == nil {
+		return false, err
+	}
+	return e.cliFinish(snap, committed, err)
 }
 
 type taskRuntime struct {
@@ -926,9 +950,26 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		triggers := t.drainTriggers()
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
 		pctx := e.budgetRoundCtx(e.plannerGateContext(ectx, t, intercept.DefaultTargetWaitBound), t, false)
-		e.BeginLLMCall(t.ID)
-		met, reason, err := planner.Plan(pctx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, t.TargetGuard.Hooks(), emit)
-		e.EndLLMCall(t.ID)
+		var (
+			met    bool
+			reason string
+			err    error
+		)
+		const maxCLIFailovers = 16
+		for failover := 0; failover < maxCLIFailovers; failover++ {
+			snap := e.beginCLIAttempt(pctx, t, "planner")
+			e.BeginLLMCall(t.ID)
+			met, reason, err = planner.Plan(pctx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, t.TargetGuard.Hooks(), emit)
+			e.EndLLMCall(t.ID)
+			if ectx.Err() != nil {
+				break
+			}
+			retry, handledErr := e.finishCLIAttempt(snap, met, err)
+			err = handledErr
+			if !retry {
+				break
+			}
+		}
 		switch {
 		case err != nil && ectx.Err() == nil:
 			log.Printf("[planner] task %s planning error: %v", t.ID, err)
@@ -1154,16 +1195,32 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		budget: meter,
 	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
-	e.BeginLLMCall(t.ID)
 	var reason harness.TerminalReason
 	var wrote agent.WriteCounts
 	var err error
-	if hasChatMessage {
-		reason, wrote, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message)
-	} else {
-		reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
+	runWorkerOnce := func() {
+		const maxCLIFailovers = 16
+		for failover := 0; failover < maxCLIFailovers; failover++ {
+			snap := e.beginCLIAttempt(workCtx, t, "worker")
+			e.BeginLLMCall(t.ID)
+			if hasChatMessage {
+				reason, wrote, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message)
+			} else {
+				reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
+			}
+			e.EndLLMCall(t.ID)
+			if workCtx.Err() != nil || ectx.Err() != nil {
+				break
+			}
+			committed := wrote != (agent.WriteCounts{})
+			retry, handledErr := e.finishCLIAttempt(snap, committed, err)
+			err = handledErr
+			if !retry {
+				break
+			}
+		}
 	}
-	e.EndLLMCall(t.ID)
+	runWorkerOnce()
 	// model_error finish → a few extra reruns (retry after backoff). Retry only while
 	// the intent still belongs to this work and the task is not paused/killed/cancelled
 	// [and has not entered settlement]; otherwise yield to the matching branch (no retries during settlement, so backoff does not eat into other workers' graceful-settlement window).
@@ -1176,13 +1233,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		if sleepCtx(workCtx, retryBackoff) {
 			break // cancelled during backoff (kill/pause) → handled by the branches below
 		}
-		e.BeginLLMCall(t.ID)
-		if hasChatMessage {
-			reason, wrote, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message)
-		} else {
-			reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
-		}
-		e.EndLLMCall(t.ID)
+		runWorkerOnce()
 	}
 	stopHeartbeat() // no longer busy: the state writes below follow within the just-renewed claim
 	if meter != nil {
