@@ -105,6 +105,11 @@ func runFakeCLI() error {
 			sysPrompt = string(data)
 		}
 	} else {
+		if strings.HasPrefix(sysPrompt, "Read and strictly follow all system instructions in ") {
+			if data, err := os.ReadFile(".xetra-system.md"); err == nil {
+				sysPrompt = string(data)
+			}
+		}
 		stdinBytes, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return fmt.Errorf("read stdin: %w", err)
@@ -201,6 +206,24 @@ func runFakeCLI() error {
 
 	case "model-mcp-and-hooks":
 		return handleMCPAndHooks(isAgy, mcpConfigPath, settingsPath)
+
+	case "model-agent-worker":
+		return handleAgentWorker(isAgy, sessionID, resumeID, convID, sysPrompt, prompt, mcpConfigPath, settingsPath)
+
+	case "model-agent-planner":
+		return handleAgentPlanner(isAgy, sessionID, sysPrompt, prompt, mcpConfigPath, settingsPath)
+
+	case "model-agent-goals":
+		return handleAgentGoals(isAgy, sessionID, sysPrompt, mcpConfigPath)
+
+	case "model-agent-mainagent":
+		return handleAgentMainAgent(isAgy, sessionID, resumeID, convID, prompt, mcpConfigPath, settingsPath)
+
+	case "model-agent-chat":
+		return handleAgentChat(isAgy, sessionID, resumeID, convID, mcpConfigPath, settingsPath)
+
+	case "model-agent-concurrent-agy":
+		return handleAgentConcurrentAgy(isAgy, sysPrompt)
 
 	default:
 		// Default completion (e.g. "sonnet", "gemini-4-hydrogen-high") for TestConnection and general callers.
@@ -855,4 +878,474 @@ func emitResult(isAgy bool, sid, text string, isErr bool, errText string, in, ou
 			"cache_creation_input_tokens": cacheWrite,
 		},
 	})
+}
+
+func resolveRunSessionID(isAgy bool, sessionID, resumeID, convID string) (sid string, resumeTarget string) {
+	if isAgy {
+		if convID != "" {
+			return convID, convID
+		}
+		return fmt.Sprintf("agy-conv-%d", time.Now().UnixNano()), ""
+	}
+	if resumeID != "" {
+		return resumeID, resumeID
+	}
+	if sessionID != "" {
+		return sessionID, ""
+	}
+	return fmt.Sprintf("claude-sess-%d", time.Now().UnixNano()), ""
+}
+
+func flagVals(name string) []string {
+	var vals []string
+	for i := 1; i < len(os.Args)-1; i++ {
+		if os.Args[i] == name {
+			vals = append(vals, os.Args[i+1])
+		}
+	}
+	return vals
+}
+
+func exerciseHooksIfConfigured(isAgy bool, settingsPath string) error {
+	preCmd, postCmd, err := loadHookCommands(isAgy, settingsPath)
+	if err != nil {
+		return err
+	}
+	blockedIn := json.RawMessage(`{"command":"rm -rf /blocked"}`)
+	if isAgy {
+		blockedIn = json.RawMessage(`{"CommandLine":"rm -rf /blocked"}`)
+	}
+	emitToolUse(isAgy, 1, "tu_hook_block", bashToolName(isAgy), blockedIn)
+	decision, reason, err := invokeHook(preCmd, buildHookPayload(isAgy, bashToolName(isAgy), blockedIn, "", false))
+	if err != nil {
+		return fmt.Errorf("pre-hook block: %w", err)
+	}
+	if decision != "deny" {
+		return fmt.Errorf("expected deny decision, got %q (%s)", decision, reason)
+	}
+	emitToolResult(isAgy, 1, "tu_hook_block", bashToolName(isAgy), "blocked:"+reason, true)
+
+	allowIn := json.RawMessage(`{"command":"echo allowed"}`)
+	if isAgy {
+		allowIn = json.RawMessage(`{"CommandLine":"echo allowed"}`)
+	}
+	emitToolUse(isAgy, 2, "tu_hook_allow", bashToolName(isAgy), allowIn)
+	decision, reason, err = invokeHook(preCmd, buildHookPayload(isAgy, bashToolName(isAgy), allowIn, "", false))
+	if err != nil {
+		return fmt.Errorf("pre-hook allow: %w", err)
+	}
+	if decision == "deny" {
+		return fmt.Errorf("unexpected deny on allowed command: %s", reason)
+	}
+	if postCmd != "" {
+		if _, _, err := invokeHook(postCmd, buildHookPayload(isAgy, bashToolName(isAgy), allowIn, "allowed", false)); err != nil {
+			return fmt.Errorf("post-hook: %w", err)
+		}
+	}
+	emitToolResult(isAgy, 2, "tu_hook_allow", bashToolName(isAgy), "allowed", false)
+	return nil
+}
+
+func openFakeMCP(isAgy bool, mcpConfigPath string) (*http.Client, string, string, []string, error) {
+	mcpURL, err := loadMCPURL(isAgy, mcpConfigPath)
+	if err != nil {
+		return nil, "", "", nil, err
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: 10 * time.Second}
+	mcpSID, err := mcpInitialize(client, mcpURL)
+	if err != nil {
+		return nil, "", "", nil, err
+	}
+	tools, err := mcpListTools(client, mcpURL, mcpSID)
+	if err != nil {
+		return nil, "", "", nil, err
+	}
+	return client, mcpURL, mcpSID, tools, nil
+}
+
+func parseIntentIDFromSystem(sys string) int64 {
+	const prefix = "Intent id: "
+	idx := strings.Index(sys, prefix)
+	if idx < 0 {
+		return 0
+	}
+	rest := sys[idx+len(prefix):]
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return 0
+	}
+	id, _ := strconv.ParseInt(fields[0], 10, 64)
+	return id
+}
+
+func handleAgentWorker(isAgy bool, sessionID, resumeID, convID, sysPrompt, prompt, mcpConfigPath, settingsPath string) error {
+	sid, resumeTarget := resolveRunSessionID(isAgy, sessionID, resumeID, convID)
+	emitInit(isAgy, sid)
+
+	if err := exerciseHooksIfConfigured(isAgy, settingsPath); err != nil {
+		return err
+	}
+	client, mcpURL, mcpSID, toolNames, err := openFakeMCP(isAgy, mcpConfigPath)
+	if err != nil {
+		return err
+	}
+	for _, reqTool := range []string{"record_fact", "insert_assets", "report_finding", "list_findings"} {
+		if !slices.Contains(toolNames, reqTool) {
+			return fmt.Errorf("worker missing MCP tool %q in %v", reqTool, toolNames)
+		}
+	}
+	for _, nativeTool := range []string{"Bash", "Read", "Write", "Edit"} {
+		if slices.Contains(toolNames, nativeTool) {
+			return fmt.Errorf("worker unexpectedly exposed native tool %q over MCP", nativeTool)
+		}
+	}
+	intentID := parseIntentIDFromSystem(sysPrompt)
+	if intentID <= 0 {
+		return fmt.Errorf("missing Intent id in worker system prompt")
+	}
+
+	cwd, _ := os.Getwd()
+	parentDir := filepath.Dir(cwd)
+	if _, err := os.Stat(filepath.Join(parentDir, ".agents")); err == nil {
+		return fmt.Errorf("parent task dir %q unexpectedly contains .agents", parentDir)
+	}
+
+	if resumeTarget != "" {
+		if !strings.Contains(prompt, "steer-target") {
+			return fmt.Errorf("resumed worker prompt missing steered message: %q", prompt)
+		}
+		factArgs, _ := json.Marshal(map[string]any{
+			"intent_id":  intentID,
+			"summary":    "worker steered fact",
+			"detail":     prompt,
+			"confidence": "observed",
+			"source":     "operator_input",
+		})
+		emitMCPToolUse(isAgy, 3, "tu_fact_resume", "record_fact", factArgs)
+		out, isErr, err := mcpCallTool(client, mcpURL, mcpSID, "record_fact", factArgs)
+		if err != nil || isErr {
+			return fmt.Errorf("record_fact on resume failed: err=%v isErr=%v out=%s", err, isErr, out)
+		}
+		emitToolResult(isAgy, 3, "tu_fact_resume", "record_fact", out, isErr)
+		reply := "worker resumed:" + resumeTarget
+		emitText(isAgy, reply)
+		emitResult(isAgy, sid, reply, false, "", 90, 30, 10, 0)
+		return nil
+	}
+
+	if slices.Contains(toolNames, "extra_probe") {
+		extraArgs := json.RawMessage(`{"tag":"worker-extra"}`)
+		emitMCPToolUse(isAgy, 3, "tu_extra", "extra_probe", extraArgs)
+		out, isErr, err := mcpCallTool(client, mcpURL, mcpSID, "extra_probe", extraArgs)
+		if err != nil || isErr {
+			return fmt.Errorf("extra_probe failed: err=%v isErr=%v out=%s", err, isErr, out)
+		}
+		emitToolResult(isAgy, 3, "tu_extra", "extra_probe", out, isErr)
+	}
+
+	factArgs, _ := json.Marshal(map[string]any{
+		"intent_id":  intentID,
+		"summary":    "worker initial fact",
+		"detail":     "cwd=" + cwd,
+		"confidence": "observed",
+		"source":     "tool_output",
+	})
+	emitMCPToolUse(isAgy, 4, "tu_fact", "record_fact", factArgs)
+	out, isErr, err := mcpCallTool(client, mcpURL, mcpSID, "record_fact", factArgs)
+	if err != nil || isErr {
+		return fmt.Errorf("record_fact failed: err=%v isErr=%v out=%s", err, isErr, out)
+	}
+	emitToolResult(isAgy, 4, "tu_fact", "record_fact", out, isErr)
+
+	findArgs, _ := json.Marshal(map[string]any{
+		"intent_id": intentID,
+		"vulnclass": "XSS",
+		"name":      "Reflected XSS",
+		"severity":  "high",
+		"summary":   "verified XSS on /search",
+		"evidence":  "alert(1)",
+	})
+	emitMCPToolUse(isAgy, 5, "tu_finding", "report_finding", findArgs)
+	fOut, fErr, err := mcpCallTool(client, mcpURL, mcpSID, "report_finding", findArgs)
+	if err != nil || fErr {
+		return fmt.Errorf("report_finding failed: err=%v isErr=%v out=%s", err, fErr, fOut)
+	}
+	emitToolResult(isAgy, 5, "tu_finding", "report_finding", fOut, fErr)
+
+	reply := "worker initial done"
+	emitText(isAgy, reply)
+	emitResult(isAgy, sid, reply, false, "", 110, 40, 15, 5)
+	return nil
+}
+
+func handleAgentPlanner(isAgy bool, sessionID, sysPrompt, prompt, mcpConfigPath, settingsPath string) error {
+	_ = sysPrompt
+	sid, _ := resolveRunSessionID(isAgy, sessionID, "", "")
+	emitInit(isAgy, sid)
+
+	cwd, _ := os.Getwd()
+	if filepath.Base(cwd) != "planner" {
+		return fmt.Errorf("planner cwd %q is not isolated planner subdir", cwd)
+	}
+	addDirs := flagVals("--add-dir")
+	parentTaskDir := filepath.Dir(cwd)
+	if !slices.Contains(addDirs, parentTaskDir) {
+		return fmt.Errorf("planner --add-dir %v missing task dir %q", addDirs, parentTaskDir)
+	}
+
+	if err := exerciseHooksIfConfigured(isAgy, settingsPath); err != nil {
+		return err
+	}
+	client, mcpURL, mcpSID, toolNames, err := openFakeMCP(isAgy, mcpConfigPath)
+	if err != nil {
+		return err
+	}
+	for _, reqTool := range []string{"TodoWrite", "add_intent", "prove_goal", "graph_overview", "list_goals", "list_facts"} {
+		if !slices.Contains(toolNames, reqTool) {
+			return fmt.Errorf("planner missing MCP tool %q in %v", reqTool, toolNames)
+		}
+	}
+
+	if strings.Contains(prompt, "[Your planning todos") {
+		if !strings.Contains(prompt, "step 1: recon") || !strings.Contains(prompt, "step 2: exploit") {
+			return fmt.Errorf("planner round 2 missing persisted todos in prompt: %q", prompt)
+		}
+		todoArgs := json.RawMessage(`{"todos":[{"content":"step 1: recon","status":"completed"},{"content":"step 2: exploit","status":"in_progress"}]}`)
+		emitMCPToolUse(isAgy, 3, "tu_todo_2", "TodoWrite", todoArgs)
+		out, isErr, err := mcpCallTool(client, mcpURL, mcpSID, "TodoWrite", todoArgs)
+		if err != nil || isErr {
+			return fmt.Errorf("TodoWrite round 2 failed: err=%v isErr=%v out=%s", err, isErr, out)
+		}
+		emitToolResult(isAgy, 3, "tu_todo_2", "TodoWrite", out, isErr)
+
+		goalsOut, _, err := mcpCallTool(client, mcpURL, mcpSID, "list_goals", json.RawMessage(`{}`))
+		if err != nil {
+			return fmt.Errorf("list_goals failed: %w", err)
+		}
+		factsOut, _, err := mcpCallTool(client, mcpURL, mcpSID, "list_facts", json.RawMessage(`{}`))
+		if err != nil {
+			return fmt.Errorf("list_facts failed: %w", err)
+		}
+		var goals []struct {
+			ID int64 `json:"id"`
+		}
+		_ = json.Unmarshal([]byte(goalsOut), &goals)
+		var facts struct {
+			Facts []struct {
+				ID int64 `json:"id"`
+			} `json:"facts"`
+		}
+		_ = json.Unmarshal([]byte(factsOut), &facts)
+		if len(goals) > 0 && len(facts.Facts) > 0 {
+			proveArgs, _ := json.Marshal(map[string]any{
+				"goal_id":     goals[0].ID,
+				"evidence_id": facts.Facts[0].ID,
+				"reason":      "verified by observed fact",
+			})
+			emitMCPToolUse(isAgy, 4, "tu_prove", "prove_goal", proveArgs)
+			pOut, pErr, err := mcpCallTool(client, mcpURL, mcpSID, "prove_goal", proveArgs)
+			if err != nil || pErr {
+				return fmt.Errorf("prove_goal failed: err=%v isErr=%v out=%s", err, pErr, pOut)
+			}
+			emitToolResult(isAgy, 4, "tu_prove", "prove_goal", pOut, pErr)
+		}
+
+		reply := "planner round 2 done"
+		emitText(isAgy, reply)
+		emitResult(isAgy, sid, reply, false, "", 130, 50, 20, 0)
+		return nil
+	}
+
+	todoArgs := json.RawMessage(`{"todos":[{"content":"step 1: recon","status":"in_progress"},{"content":"step 2: exploit","status":"pending"}]}`)
+	emitMCPToolUse(isAgy, 3, "tu_todo_1", "TodoWrite", todoArgs)
+	out, isErr, err := mcpCallTool(client, mcpURL, mcpSID, "TodoWrite", todoArgs)
+	if err != nil || isErr {
+		return fmt.Errorf("TodoWrite round 1 failed: err=%v isErr=%v out=%s", err, isErr, out)
+	}
+	emitToolResult(isAgy, 3, "tu_todo_1", "TodoWrite", out, isErr)
+
+	intentArgs := json.RawMessage(`{"summary":"Run step 1 recon","priority":8}`)
+	emitMCPToolUse(isAgy, 4, "tu_intent_1", "add_intent", intentArgs)
+	iOut, iErr, err := mcpCallTool(client, mcpURL, mcpSID, "add_intent", intentArgs)
+	if err != nil || iErr {
+		return fmt.Errorf("add_intent failed: err=%v isErr=%v out=%s", err, iErr, iOut)
+	}
+	emitToolResult(isAgy, 4, "tu_intent_1", "add_intent", iOut, iErr)
+
+	reply := "planner round 1 done"
+	emitText(isAgy, reply)
+	emitResult(isAgy, sid, reply, false, "", 100, 35, 10, 0)
+	return nil
+}
+
+func handleAgentGoals(isAgy bool, sessionID, sysPrompt, mcpConfigPath string) error {
+	_ = sysPrompt
+	sid, _ := resolveRunSessionID(isAgy, sessionID, "", "")
+	emitInit(isAgy, sid)
+
+	cwd, _ := os.Getwd()
+	base := filepath.Base(cwd)
+	if base != "goals" && !strings.HasPrefix(base, "xetra-goals-") {
+		return fmt.Errorf("goals cwd %q is not isolated goals dir", cwd)
+	}
+
+	client, mcpURL, mcpSID, toolNames, err := openFakeMCP(isAgy, mcpConfigPath)
+	if err != nil {
+		return err
+	}
+	for _, reqTool := range []string{"set_goals", "set_constraints"} {
+		if !slices.Contains(toolNames, reqTool) {
+			return fmt.Errorf("goals missing MCP tool %q in %v", reqTool, toolNames)
+		}
+	}
+
+	cArgs := json.RawMessage(`{"text":"passive recon only on app.example.com","type":"allow"}`)
+	emitMCPToolUse(isAgy, 1, "tu_constraints", "set_constraints", cArgs)
+	cOut, cErr, err := mcpCallTool(client, mcpURL, mcpSID, "set_constraints", cArgs)
+	if err != nil || cErr {
+		return fmt.Errorf("set_constraints failed: err=%v isErr=%v out=%s", err, cErr, cOut)
+	}
+	emitToolResult(isAgy, 1, "tu_constraints", "set_constraints", cOut, cErr)
+
+	gArgs := json.RawMessage(`{"goals":[{"text":"Prove authentication bypass on /admin","vulnclass":"AuthBypass"},{"text":"Verify IDOR on /api/users","vulnclass":"IDOR"}]}`)
+	emitMCPToolUse(isAgy, 2, "tu_goals", "set_goals", gArgs)
+	gOut, gErr, err := mcpCallTool(client, mcpURL, mcpSID, "set_goals", gArgs)
+	if err != nil || gErr {
+		return fmt.Errorf("set_goals failed: err=%v isErr=%v out=%s", err, gErr, gOut)
+	}
+	emitToolResult(isAgy, 2, "tu_goals", "set_goals", gOut, gErr)
+
+	reply := "goals decomposed"
+	emitText(isAgy, reply)
+	emitResult(isAgy, sid, reply, false, "", 80, 25, 0, 0)
+	return nil
+}
+
+func handleAgentMainAgent(isAgy bool, sessionID, resumeID, convID, prompt, mcpConfigPath, settingsPath string) error {
+	sid, resumeTarget := resolveRunSessionID(isAgy, sessionID, resumeID, convID)
+	emitInit(isAgy, sid)
+
+	cwd, _ := os.Getwd()
+	if filepath.Base(cwd) != "mainagent" {
+		return fmt.Errorf("mainagent cwd %q is not isolated mainagent subdir", cwd)
+	}
+	addDirs := flagVals("--add-dir")
+	parentTaskDir := filepath.Dir(cwd)
+	if !slices.Contains(addDirs, parentTaskDir) {
+		return fmt.Errorf("mainagent --add-dir %v missing task dir %q", addDirs, parentTaskDir)
+	}
+
+	if err := exerciseHooksIfConfigured(isAgy, settingsPath); err != nil {
+		return err
+	}
+	client, mcpURL, mcpSID, toolNames, err := openFakeMCP(isAgy, mcpConfigPath)
+	if err != nil {
+		return err
+	}
+	for _, reqTool := range []string{"add_hint", "add_intent", "set_goals", "set_constraints", "graph_overview"} {
+		if !slices.Contains(toolNames, reqTool) {
+			return fmt.Errorf("mainagent missing MCP tool %q in %v", reqTool, toolNames)
+		}
+	}
+
+	if resumeTarget != "" {
+		iArgs := json.RawMessage(`{"summary":"test auth flow per operator","priority":9}`)
+		emitMCPToolUse(isAgy, 3, "tu_main_intent", "add_intent", iArgs)
+		out, isErr, err := mcpCallTool(client, mcpURL, mcpSID, "add_intent", iArgs)
+		if err != nil || isErr {
+			return fmt.Errorf("mainagent add_intent failed: err=%v isErr=%v out=%s", err, isErr, out)
+		}
+		emitToolResult(isAgy, 3, "tu_main_intent", "add_intent", out, isErr)
+		reply := "main resumed:" + resumeTarget
+		emitText(isAgy, reply)
+		emitResult(isAgy, sid, reply, false, "", 75, 25, 10, 0)
+		return nil
+	}
+
+	hintText := "focus on auth flow"
+	if strings.Contains(prompt, "seg1-fresh") {
+		hintText = "segment 1 fresh hint"
+	}
+	hArgs, _ := json.Marshal(map[string]any{"text": hintText})
+	emitMCPToolUse(isAgy, 3, "tu_main_hint", "add_hint", hArgs)
+	out, isErr, err := mcpCallTool(client, mcpURL, mcpSID, "add_hint", hArgs)
+	if err != nil || isErr {
+		return fmt.Errorf("mainagent add_hint failed: err=%v isErr=%v out=%s", err, isErr, out)
+	}
+	emitToolResult(isAgy, 3, "tu_main_hint", "add_hint", out, isErr)
+
+	reply := "main fresh:" + sid
+	emitText(isAgy, reply)
+	emitResult(isAgy, sid, reply, false, "", 70, 20, 0, 0)
+	return nil
+}
+
+func handleAgentChat(isAgy bool, sessionID, resumeID, convID, mcpConfigPath, settingsPath string) error {
+	sid, resumeTarget := resolveRunSessionID(isAgy, sessionID, resumeID, convID)
+	emitInit(isAgy, sid)
+
+	cwd, _ := os.Getwd()
+	if filepath.Base(filepath.Dir(cwd)) != "sessions" {
+		return fmt.Errorf("chat cwd %q is not under sessions/<id>", cwd)
+	}
+
+	if err := exerciseHooksIfConfigured(isAgy, settingsPath); err != nil {
+		return err
+	}
+	client, mcpURL, mcpSID, toolNames, err := openFakeMCP(isAgy, mcpConfigPath)
+	if err != nil {
+		return err
+	}
+	if slices.Contains(toolNames, "retester_probe") {
+		args := json.RawMessage(`{"finding_id":42}`)
+		emitMCPToolUse(isAgy, 3, "tu_retester", "retester_probe", args)
+		out, isErr, err := mcpCallTool(client, mcpURL, mcpSID, "retester_probe", args)
+		if err != nil || isErr {
+			return fmt.Errorf("retester_probe failed: err=%v isErr=%v out=%s", err, isErr, out)
+		}
+		emitToolResult(isAgy, 3, "tu_retester", "retester_probe", out, isErr)
+	}
+
+	reply := "chat fresh:" + sid
+	if resumeTarget != "" {
+		reply = "chat resumed:" + resumeTarget
+	}
+	emitText(isAgy, reply)
+	emitResult(isAgy, sid, reply, false, "", 60, 18, 5, 0)
+	return nil
+}
+
+func handleAgentConcurrentAgy(isAgy bool, sysPrompt string) error {
+	if !isAgy {
+		return fmt.Errorf("model-agent-concurrent-agy requires agy-cli")
+	}
+	cwd, _ := os.Getwd()
+	role := filepath.Base(cwd)
+	parentDir := filepath.Dir(cwd)
+	rulesPath := filepath.Join(cwd, ".agents", "plugins", "xetra", "rules", "AGENTS.md")
+	before, err := os.ReadFile(rulesPath)
+	if err != nil {
+		return fmt.Errorf("%s read rules before sleep: %w", role, err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	after, err := os.ReadFile(rulesPath)
+	if err != nil {
+		return fmt.Errorf("%s read rules after sleep (collision!): %w", role, err)
+	}
+	if string(before) != string(after) {
+		return fmt.Errorf("%s rules mutated mid-run", role)
+	}
+	if _, err := os.Stat(filepath.Join(parentDir, ".agents")); err == nil {
+		return fmt.Errorf("parent dir %q has .agents directory", parentDir)
+	}
+	if !strings.Contains(sysPrompt, role) && !strings.Contains(string(after), role) {
+		// Check role-specific prompt isolation (worker/planner/mainagent).
+		_ = sysPrompt
+	}
+	sid := fmt.Sprintf("agy-conc-%s-%d", role, time.Now().UnixNano())
+	emitInit(true, sid)
+	reply := "concurrent-ok:" + role
+	emitText(true, reply)
+	emitResult(true, sid, reply, false, "", 40, 10, 0, 0)
+	return nil
 }

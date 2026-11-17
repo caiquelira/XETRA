@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/Autumn-27/artex/db"
@@ -111,6 +112,72 @@ func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir,
 	if prov == nil {
 		return nil
 	}
+	if cliOpts, ok := resolveCLIAgentOptionsForContext(ctx, nil, prov); ok {
+		return DecomposeGoalsWithCLI(ctx, cliOpts, dataDir, goalText, desc, as, ts, taskID, emit)
+	}
+	ctx, sys, userMsg, tools, captureEmit := prepareGoalsRun(ctx, dataDir, goalText, desc, as, ts, taskID, emit)
+	captureRun(ctx, agentcore.Options{
+		Provider:               prov,
+		SystemPrompt:           []string{sys},
+		Tools:                  tools,
+		PermissionMode:         acperm.ModeBypass,
+		DisableBackgroundTasks: true,
+		// 3 steps (extract constraints → register scope → decompose goals) each need one tool call; give enough turns so set_goals is not missed before wrap-up.
+		MaxTurns:     8,
+		NonStreaming: nonStreaming, // when this profile selects non-streaming, use Provider.Complete
+		MaxTokens:    maxTokens,    // 0 = send no cap, the server's default decides
+	}, userMsg, captureEmit)
+	return readGoalsFromStore(ts)
+}
+
+// DecomposeGoalsWithConfig runs goal decomposition through a headless CLI Config.
+func DecomposeGoalsWithConfig(ctx context.Context, cfg Config, dataDir, goalText, desc string, as *db.AssetStore, ts *db.ExplorationStore, taskID int64, emit func(db.Activity)) []GoalSpec {
+	return DecomposeGoalsWithCLI(ctx, CLIAgentOptions{Config: cfg}, dataDir, goalText, desc, as, ts, taskID, emit)
+}
+
+// DecomposeGoalsWithCLI runs goal decomposition via a headless CLI backend
+// (claude-cli or agy-cli) in an isolated working directory, exposing the exact
+// set_goals, set_constraints, and optional add_task_scope tools over mcpbridge.
+func DecomposeGoalsWithCLI(ctx context.Context, cli CLIAgentOptions, dataDir, goalText, desc string, as *db.AssetStore, ts *db.ExplorationStore, taskID int64, emit func(db.Activity)) []GoalSpec {
+	if !cli.Config.IsCLI() {
+		return nil
+	}
+	ctx, sys, userMsg, tools, captureEmit := prepareGoalsRun(ctx, dataDir, goalText, desc, as, ts, taskID, emit)
+
+	var (
+		workDir   string
+		extraDirs []string
+	)
+	if dataDir != "" && taskID > 0 {
+		workDir = ensureRoleRunDir(dataDir, taskID, "goals")
+		extraDirs = taskExtraDirs(dataDir, taskID)
+	} else {
+		tmpDir, err := os.MkdirTemp("", "xetra-goals-*")
+		if err != nil {
+			return nil
+		}
+		defer os.RemoveAll(tmpDir)
+		workDir = tmpDir
+	}
+
+	_, _, _ = runCLI(ctx, CLIRunOptions{
+		Config:       cli.Config,
+		SystemPrompt: sys,
+		Prompt:       userMsg,
+		WorkDir:      workDir,
+		ExtraDirs:    extraDirs,
+		Tools:        tools,
+		Bridge:       cli.Bridge,
+		HookBin:      cli.HookBin,
+		MaxTurns:     8,
+		WorkerLabel:  "goals",
+		UsagePG:      cli.UsagePG,
+		Emit:         captureEmit,
+	})
+	return readGoalsFromStore(ts)
+}
+
+func prepareGoalsRun(ctx context.Context, dataDir, goalText, desc string, as *db.AssetStore, ts *db.ExplorationStore, taskID int64, emit func(db.Activity)) (context.Context, string, string, []actool.CoreTool, func(db.Activity)) {
 	// Goal decomposition is a one-shot call: it does not attach a transcript store, so
 	// agentcore does not put a session id on the ctx (it only does when there is a
 	// writer, see agentcore.Prompt). Gateways that do prompt caching / sticky routing by
@@ -154,17 +221,10 @@ func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir,
 			emit(r)
 		}
 	}
-	captureRun(ctx, agentcore.Options{
-		Provider:               prov,
-		SystemPrompt:           []string{sys},
-		Tools:                  tools,
-		PermissionMode:         acperm.ModeBypass,
-		DisableBackgroundTasks: true,
-		// 3 steps (extract constraints → register scope → decompose goals) each need one tool call; give enough turns so set_goals is not missed before wrap-up.
-		MaxTurns:     8,
-		NonStreaming: nonStreaming, // when this profile selects non-streaming, use Provider.Complete
-		MaxTokens:    maxTokens,    // 0 = send no cap, the server's default decides
-	}, userMsg, captureEmit)
+	return ctx, sys, userMsg, tools, captureEmit
+}
+
+func readGoalsFromStore(ts *db.ExplorationStore) []GoalSpec {
 	// set_goals persisted the goals directly; read them back so the caller sees what
 	// was written (empty slice ⇒ the LLM produced nothing ⇒ caller falls back).
 	if ts == nil {

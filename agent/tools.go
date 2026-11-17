@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Autumn-27/artex/db"
 	acperm "github.com/Autumn-27/norma/permission"
@@ -155,6 +156,7 @@ type ToolSet struct {
 	ownerNode int64
 	GoalMet   bool
 	Reason    string
+	writesMu  sync.Mutex
 	writes    WriteCounts
 	// killWork, if set, terminates a running work by intent id (engine callback,
 	// wired by the planner). nil = the kill_work tool reports unavailable.
@@ -246,7 +248,29 @@ func (w WriteCounts) String() string {
 // Writes reports what this run wrote back, split by node kind (so the engine can
 // tell "explored but persisted nothing" apart from a completed intent, and log an
 // honest breakdown instead of calling assets/findings "facts").
-func (t *ToolSet) Writes() WriteCounts { return t.writes }
+func (t *ToolSet) Writes() WriteCounts {
+	t.writesMu.Lock()
+	defer t.writesMu.Unlock()
+	return t.writes
+}
+
+func (t *ToolSet) addWriteFact() {
+	t.writesMu.Lock()
+	t.writes.Facts++
+	t.writesMu.Unlock()
+}
+
+func (t *ToolSet) addWriteAsset() {
+	t.writesMu.Lock()
+	t.writes.Assets++
+	t.writesMu.Unlock()
+}
+
+func (t *ToolSet) addWriteFinding() {
+	t.writesMu.Lock()
+	t.writes.Findings++
+	t.writesMu.Unlock()
+}
 
 func NewToolSet(ts *db.ExplorationStore, worker string) *ToolSet {
 	return &ToolSet{ts: ts, worker: worker}
@@ -449,6 +473,9 @@ func (t *ToolSet) graphOverview() actool.CoreTool {
 // an empty context and always needs this first).
 func (t *ToolSet) graphOverviewData() map[string]any {
 	out := map[string]any{}
+	if t.ts == nil {
+		return out
+	}
 	// goals summary folded in so the planner needn't call list_goals each round.
 	goals, _ := t.ts.ListByKind(db.KindGoal, 100)
 	gsum := make([]map[string]any, 0, len(goals))
@@ -1461,7 +1488,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		} else if t.notify != nil {
 			t.notify()
 		}
-		t.writes.Findings++
+		t.addWriteFinding()
 		// Keep the first line's node-ID contract for existing reporter triggers.
 		for i := range recorded.Traffic.Bindings {
 			recorded.Traffic.Bindings[i].Snapshot.ReqHead = ""
@@ -1567,7 +1594,7 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 	if intent > 0 {
 		_ = t.ts.Link(intent, db.RelYields, id) // chain: intent -> fact
 	}
-	t.writes.Facts++
+	t.addWriteFact()
 	return id, nil
 }
 

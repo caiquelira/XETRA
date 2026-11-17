@@ -2,10 +2,12 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +20,143 @@ import (
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/google/uuid"
 )
+
+// CLIAgentOptions configures headless CLI execution for multi-turn agents
+// (Worker, Planner, Goals, MainAgent, ChatAgent).
+type CLIAgentOptions struct {
+	Config  Config
+	Bridge  *mcpbridge.Server // optional shared bridge server
+	UsagePG *db.DB            // optional PG DB for llm_usage metering
+	HookBin string            // optional hook binary override (primarily for tests)
+}
+
+type cliConfigResolver interface {
+	ResolveCLIConfig(context.Context) (Config, bool)
+}
+
+type providerUnwrapper interface {
+	Unwrap() llm.Provider
+}
+
+func resolveCLIAgentOptions(explicit *CLIAgentOptions, prov llm.Provider) (CLIAgentOptions, bool) {
+	return resolveCLIAgentOptionsForContext(context.Background(), explicit, prov)
+}
+
+func resolveCLIAgentOptionsForContext(ctx context.Context, explicit *CLIAgentOptions, prov llm.Provider) (CLIAgentOptions, bool) {
+	if explicit != nil && explicit.Config.IsCLI() {
+		return *explicit, true
+	}
+	if explicit != nil && explicit.Config.Format != "" && !explicit.Config.IsCLI() {
+		return CLIAgentOptions{}, false
+	}
+	var resolved Config
+	var ok bool
+	if cp, isCP := unwrapCLICompletionProvider(prov); isCP {
+		resolved = cp.cfg
+		ok = true
+	} else if r, isRes := prov.(cliConfigResolver); isRes {
+		resolved, ok = r.ResolveCLIConfig(ctx)
+		if ok && !resolved.IsCLI() {
+			ok = false
+		}
+	}
+	if !ok {
+		return CLIAgentOptions{}, false
+	}
+	out := CLIAgentOptions{Config: resolved}
+	if explicit != nil {
+		out.Bridge = explicit.Bridge
+		out.UsagePG = explicit.UsagePG
+		out.HookBin = explicit.HookBin
+	}
+	return out, true
+}
+
+func unwrapCLICompletionProvider(prov llm.Provider) (*cliCompletionProvider, bool) {
+	for prov != nil {
+		if cp, ok := prov.(*cliCompletionProvider); ok {
+			return cp, true
+		}
+		u, ok := prov.(providerUnwrapper)
+		if !ok {
+			return nil, false
+		}
+		prov = u.Unwrap()
+	}
+	return nil, false
+}
+
+var cliNativeDefaultToolNames = map[string]bool{
+	"Read":      true,
+	"Write":     true,
+	"Edit":      true,
+	"MultiEdit": true,
+	"LS":        true,
+	"Glob":      true,
+	"Grep":      true,
+	"Bash":      true,
+	"Sleep":     true,
+}
+
+// cliToolSet strips Norma's local file/shell tools (provided natively by the
+// CLI and guarded by hooks) and appends XETRA's governed WebFetch and optional
+// web_search tools for exposure via mcpbridge.
+func cliToolSet(ctx context.Context, tools []actool.CoreTool, proxyAddr, proxyCACert string, ws WebSearchOpts) []actool.CoreTool {
+	out := make([]actool.CoreTool, 0, len(tools)+2)
+	for _, t := range tools {
+		if t == nil || cliNativeDefaultToolNames[t.Name()] {
+			continue
+		}
+		out = append(out, t)
+	}
+	out = withWebFetch(ctx, out, proxyAddr, proxyCACert)
+	if ws.Enabled {
+		if wsTool, err := actool.NewWebSearch(actool.WebSearchConfig{
+			Backend:         ws.Backend,
+			BraveAPIKey:     ws.BraveKey,
+			TavilyAPIKey:    ws.TavilyKey,
+			DeepSeekBaseURL: ws.DeepSeekBaseURL,
+			DeepSeekAPIKey:  ws.DeepSeekAPIKey,
+			DeepSeekModel:   ws.DeepSeekModel,
+			Proxy:           ws.Proxy,
+		}); err == nil {
+			out = append(out, wsTool)
+		}
+	}
+	return out
+}
+
+func ensureRoleRunDir(base string, taskID int64, role string) string {
+	dir := filepath.Join(base, "tasks", strconv.FormatInt(taskID, 10), role)
+	_ = os.MkdirAll(dir, 0o755)
+	return dir
+}
+
+func taskExtraDirs(base string, taskID int64) []string {
+	if taskID <= 0 {
+		return nil
+	}
+	return []string{filepath.Join(base, "tasks", strconv.FormatInt(taskID, 10))}
+}
+
+func hasCLISession(sessionDir, sessionKey string) bool {
+	if strings.TrimSpace(sessionDir) == "" || strings.TrimSpace(sessionKey) == "" {
+		return false
+	}
+	_, ok, err := NewCLISessionStore(sessionDir).Load(sessionKey)
+	return err == nil && ok
+}
+
+func withOptionalTimeout(ctx context.Context, maxDur time.Duration) (context.Context, context.CancelFunc) {
+	if maxDur <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, maxDur)
+}
+
+func isRunTimeout(parentCtx, runCtx context.Context, err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) && parentCtx.Err() == nil && errors.Is(runCtx.Err(), context.DeadlineExceeded)
+}
 
 // CLIRunOptions configures a full multi-turn headless CLI agent execution
 // (Claude Code `claude` or Antigravity `agy`) wired to XETRA's MCP tools,
