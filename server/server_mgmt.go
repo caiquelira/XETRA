@@ -1972,8 +1972,34 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := body.LLMProfile
+	p.Name = strings.TrimSpace(p.Name)
+	p.Format = strings.ToLower(strings.TrimSpace(p.Format))
+	p.Model = strings.TrimSpace(p.Model)
+	p.BaseURL = strings.TrimSpace(p.BaseURL)
 	p.APIKey = body.APIKey
 	p.Streaming = body.Streaming == nil || *body.Streaming
+	if p.Name == "" {
+		writeErr(w, 400, "name is required")
+		return
+	}
+	switch p.Format {
+	case "openai", "anthropic", "openai-responses", "ollama", "claude-cli", "agy-cli":
+	default:
+		writeErr(w, 400, "unsupported LLM profile format")
+		return
+	}
+	if agent.IsCLIFormat(llm.Format(p.Format)) {
+		// BaseURL holds an optional local CLI binary path override; allow local file paths without HTTP URL parsing.
+		if strings.ContainsAny(p.BaseURL, "\r\n\x00") {
+			writeErr(w, 400, "CLI binary path contains invalid control characters")
+			return
+		}
+		if p.Model == "" {
+			if b, ok := agent.LookupCLIBackend(llm.Format(p.Format)); ok {
+				p.Model = b.DefaultModel()
+			}
+		}
+	}
 	// The list returns the proxy masked: the placeholder sent back keeps the
 	// stored proxy and is never stored itself.
 	if isMaskedSecret(p.Proxy) {
@@ -2162,40 +2188,68 @@ func (s *Server) pgLLMPoolReset(w http.ResponseWriter, r *http.Request) {
 // the OpenAI path, it falls back to the OpenAI endpoint at the stripped root.
 func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider  string `json:"provider"` // "openai" | "anthropic" | "ollama"
+		Provider  string `json:"provider"` // "openai" | "anthropic" | "openai-responses" | "ollama" | "claude-cli" | "agy-cli"
 		BaseURL   string `json:"base_url"`
 		APIKey    string `json:"api_key"`
 		Proxy     string `json:"proxy"`
-		ProfileID *int64 `json:"profile_id"` // fallback: use stored key from this profile
+		ProfileID *int64 `json:"profile_id"` // fallback: use stored key/settings from this profile
 	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
+		return
+	}
+	var stored *db.LLMProfile
+	if req.ProfileID != nil && s.m != nil && s.m.pg != nil {
+		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
+			stored = p
+		}
+	}
+	if stored != nil {
+		if strings.TrimSpace(req.Provider) == "" {
+			req.Provider = stored.Format
+		}
+		if strings.TrimSpace(req.BaseURL) == "" {
+			req.BaseURL = stored.BaseURL
+		}
+	}
+	provider := strings.ToLower(strings.TrimSpace(req.Provider))
+	if agent.IsCLIFormat(llm.Format(provider)) {
+		b, ok := agent.LookupCLIBackend(llm.Format(provider))
+		if !ok {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": fmt.Sprintf("unknown CLI backend %q", provider)})
+			return
+		}
+		cfg := agent.ConfigFrom(provider, "", req.BaseURL, "", req.Proxy)
+		models, err := b.ListModels(r.Context(), cfg)
+		if err != nil {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		if models == nil {
+			models = []string{}
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "models": models})
 		return
 	}
 	// Resolve API key: form input > profile stored key. The stored key is only
 	// sent to the endpoint it was saved for, since base_url comes from the form.
 	apiKey := strings.TrimSpace(req.APIKey)
 	withheld := false
-	if apiKey == "" && req.ProfileID != nil {
-		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-			if sameLLMEndpoint(req.Provider, req.BaseURL, p.Format, p.BaseURL) {
-				apiKey = p.APIKey
-			} else {
-				withheld = p.APIKey != ""
-			}
+	if apiKey == "" && stored != nil {
+		if sameLLMEndpoint(req.Provider, req.BaseURL, stored.Format, stored.BaseURL) {
+			apiKey = stored.APIKey
+		} else {
+			withheld = stored.APIKey != ""
 		}
 	}
 	if isMaskedSecret(req.Proxy) { // the form echoes the masked proxy: use the stored one
 		req.Proxy = ""
-		if req.ProfileID != nil {
-			if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-				req.Proxy = p.Proxy
-			}
+		if stored != nil {
+			req.Proxy = stored.Proxy
 		}
 	}
-	provider := strings.TrimSpace(req.Provider)
-	// Ollama serves its model list keyless on the local server: no key gate.
-	if apiKey == "" && provider != "ollama" {
+	// Keyless local backends (Ollama) list models without an API key.
+	if apiKey == "" && !db.IsKeylessProfileFormat(provider) {
 		msg := "no API Key provided"
 		if withheld {
 			msg = "no API Key provided: the saved key is only sent to the endpoint it was saved for; enter the key to list models from a different base URL or provider"

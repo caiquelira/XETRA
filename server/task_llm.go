@@ -15,6 +15,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
@@ -81,9 +82,17 @@ func isTaskLLMChainExhausted(err error) bool {
 
 // isQuotaExhaustedError is intentionally strict. A generic 429, auth error,
 // network failure, or 5xx does not rotate providers; the response must explicitly
-// identify quota, credits, billing balance, or payment exhaustion.
+// identify quota, credits, billing balance, payment exhaustion, or a CLI quota
+// error from the local CLI backends.
 func isQuotaExhaustedError(err error) bool {
-	return err != nil && agent.IsQuotaExhaustedMessage(err.Error())
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "CLI quota exhausted:") {
+		return true
+	}
+	return agent.IsQuotaExhaustedMessage(msg)
 }
 
 // Consecutive-failure escalation (ouroboros cost-tier take, #99): quota
@@ -139,6 +148,7 @@ type taskLLMSelection struct {
 	profileID int64
 	revision  int64
 	provider  llm.Provider
+	cfg       agent.Config
 	// retry holds the retry parameters resolved for the profile selected this time (profile override → global policy → built-in default).
 	// Same-provider safe-window retries follow it, so switching profiles switches the retry cadence.
 	retry agent.RetryConfig
@@ -197,7 +207,7 @@ func (r *taskLLMRuntime) currentFor(ctx context.Context) (taskLLMSelection, erro
 	t, _ := r.s.m.Task(r.taskID)
 	sel := taskLLMSelection{task: t, revision: pt.LLMChainRevision}
 	if prov, cfg, ok := r.s.agentBindingProvider(r.agentKey); ok {
-		sel.provider, sel.retry = prov, cfg.Retry
+		sel.provider, sel.cfg, sel.retry = prov, cfg, cfg.Retry
 		return sel, nil
 	}
 	if len(pt.LLMProfileIDs) > 0 {
@@ -217,15 +227,201 @@ func (r *taskLLMRuntime) currentFor(ctx context.Context) (taskLLMSelection, erro
 		if !ok {
 			return sel, fmt.Errorf("LLM profile #%d is missing or invalid", sel.profileID)
 		}
-		sel.provider, sel.retry = prov, cfg.Retry
+		sel.provider, sel.cfg, sel.retry = prov, cfg, cfg.Retry
 		return sel, nil
 	}
 	prov, cfg, ok := r.s.globalProvider()
 	if !ok {
 		return sel, fmt.Errorf("task %s has no available fallback LLM provider", r.taskID)
 	}
-	sel.provider, sel.retry = prov, cfg.Retry
+	sel.provider, sel.cfg, sel.retry = prov, cfg, cfg.Retry
 	return sel, nil
+}
+
+// ResolveCLIConfig implements agent's cliConfigResolver interface so task-scoped
+// agents dynamically resolve the active headless CLI config (following role
+// bindings, per-intent pins, task failover chains, and global pool rotation).
+func (r *taskLLMRuntime) ResolveCLIConfig(ctx context.Context) (agent.Config, bool) {
+	if r == nil || r.s == nil {
+		return agent.Config{}, false
+	}
+	if r.s.m == nil || r.s.m.pg == nil {
+		prov, cfg, ok := r.s.globalProvider()
+		if !ok {
+			return agent.Config{}, false
+		}
+		return r.s.resolveCLIConfigFromProvider(prov, cfg)
+	}
+	sel, err := r.currentFor(ctx)
+	if err != nil {
+		return agent.Config{}, false
+	}
+	return r.s.resolveCLIConfigFromProvider(sel.provider, sel.cfg)
+}
+
+func (s *Server) resolveCLIConfigFromProvider(prov llm.Provider, fallback agent.Config) (agent.Config, bool) {
+	if pool, ok := prov.(*llmpool.Pool); ok {
+		if m := pool.ActiveMember(); m != nil {
+			if s != nil && s.m != nil && s.m.pg != nil {
+				if cfg, ok := s.loadProfileConfig(m.ID); ok {
+					if cfg.IsCLI() {
+						return cfg, true
+					}
+					return agent.Config{}, false
+				}
+			}
+			if agent.IsCLIFormat(llm.Format(m.Format)) {
+				cfg := agent.ConfigFrom(m.Format, m.Model, "", "", "")
+				cfg.ProfileName = m.Name
+				return cfg, true
+			}
+			return agent.Config{}, false
+		}
+	}
+	if fallback.IsCLI() {
+		return fallback, true
+	}
+	return agent.Config{}, false
+}
+
+type cliAttemptSnapshot struct {
+	runtime      *taskLLMRuntime
+	selection    taskLLMSelection
+	pool         *llmpool.Pool
+	poolMemberID int64
+	isCLI        bool
+}
+
+func (s *Server) beginTaskCLIAttempt(ctx context.Context, t *Task, agentKey string) *cliAttemptSnapshot {
+	if s == nil || t == nil {
+		return nil
+	}
+	b := s.agentsForTask(t)
+	var rt *taskLLMRuntime
+	switch agentKey {
+	case "planner":
+		rt = b.plannerRuntime
+	case "worker":
+		rt = b.workerRuntime
+	case "mainagent":
+		rt = b.mainRuntime
+	case "goals":
+		rt = b.runtime
+	}
+	return beginCLIAttempt(ctx, rt)
+}
+
+func beginCLIAttempt(ctx context.Context, r *taskLLMRuntime) *cliAttemptSnapshot {
+	if r == nil || r.s == nil {
+		return nil
+	}
+	var (
+		sel taskLLMSelection
+		err error
+	)
+	if r.s.m == nil || r.s.m.pg == nil {
+		prov, cfg, ok := r.s.globalProvider()
+		if !ok {
+			return nil
+		}
+		sel = taskLLMSelection{provider: prov, cfg: cfg}
+	} else {
+		sel, err = r.currentFor(ctx)
+		if err != nil {
+			return nil
+		}
+	}
+	cfg, isCLI := r.s.resolveCLIConfigFromProvider(sel.provider, sel.cfg)
+	if !isCLI || !cfg.IsCLI() {
+		return nil
+	}
+	snap := &cliAttemptSnapshot{runtime: r, selection: sel, isCLI: true}
+	if pool, ok := sel.provider.(*llmpool.Pool); ok {
+		snap.pool = pool
+		if m := pool.ActiveMember(); m != nil {
+			snap.poolMemberID = m.ID
+		}
+	}
+	return snap
+}
+
+func trimPoolError(err error) string {
+	s := strings.TrimSpace(strings.ReplaceAll(err.Error(), "\n", " "))
+	if len(s) > 300 {
+		s = s[:300] + "…"
+	}
+	return s
+}
+
+func finishCLIAttempt(snap *cliAttemptSnapshot, committed bool, runErr error) (retry bool, outErr error) {
+	if snap == nil || !snap.isCLI {
+		return false, runErr
+	}
+	r := snap.runtime
+	sel := snap.selection
+	if runErr == nil {
+		if sel.profileID != 0 {
+			resetLLMFailStreak(r.taskID, sel.profileID)
+		}
+		if snap.pool != nil && snap.poolMemberID > 0 {
+			if h := snap.pool.Health(); h != nil {
+				h.Pass(snap.poolMemberID)
+			}
+		}
+		return false, nil
+	}
+	if isTaskLLMRuntimeError(runErr) {
+		return false, runErr
+	}
+	if sel.profileID != 0 {
+		hooks := r.streamHooks()
+		if isQuotaExhaustedError(runErr) {
+			transition, markErr := hooks.exhaust(sel, runErr)
+			if markErr != nil {
+				cause := fmt.Errorf("mark profile quota exhausted after %v: %w", runErr, markErr)
+				if committed {
+					return false, &taskLLMError{taskID: r.taskID, cause: cause}
+				}
+				return false, cause
+			}
+			if transition.Advanced && !transition.Stale && hooks.transition != nil {
+				hooks.transition(sel, transition, runErr)
+			}
+			if committed || (!transition.Stale && transition.NextProfileID == nil) {
+				return false, &taskLLMError{taskID: r.taskID, chainExhausted: transition.ChainExhausted, cause: runErr}
+			}
+			return true, nil
+		}
+		if !committed && noteLLMCallFailure(r.taskID, sel.profileID) {
+			cause := fmt.Errorf("profile #%d failed %d consecutive calls (last: %w)", sel.profileID, llmFailStreakThreshold, runErr)
+			transition, markErr := hooks.exhaust(sel, cause)
+			if markErr != nil {
+				return false, fmt.Errorf("mark profile exhausted after %v: %w", runErr, markErr)
+			}
+			if transition.Advanced && !transition.Stale && hooks.transition != nil {
+				hooks.transition(sel, transition, runErr)
+			}
+			if !transition.Stale && transition.NextProfileID == nil {
+				return false, &taskLLMError{taskID: r.taskID, chainExhausted: transition.ChainExhausted, cause: runErr}
+			}
+			return true, nil
+		}
+		return false, runErr
+	}
+	if snap.pool != nil && snap.poolMemberID > 0 {
+		hard := isQuotaExhaustedError(runErr)
+		if h := snap.pool.Health(); h != nil {
+			if h.Trip(snap.poolMemberID, trimPoolError(runErr), hard) {
+				log.Printf("[llmpool] CLI profile #%d breaker tripped: %s", snap.poolMemberID, trimPoolError(runErr))
+			}
+		}
+		if !committed && hard {
+			if next := snap.pool.ActiveMember(); next != nil && next.ID != snap.poolMemberID {
+				return true, nil
+			}
+		}
+	}
+	return false, runErr
 }
 
 // activeCfg resolves the task's currently-active LLM config, mirroring current()'s
@@ -741,8 +937,10 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	workerRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "worker"}
 	mainRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "mainagent"}
 	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
+	cliOpts := s.cliAgentOptions()
 	window := workerRuntime.CompactionWindow()
 	wk := agent.NewWorker(workerRuntime, "task-router", s.m.dir, tx, window, s.agentMaxTurns("worker"))
+	wk.SetCLIOptions(cliOpts)
 	wk.SetFindingRecorder(s.evidenceStore())
 	wk.SetCompactionWindowResolver(workerRuntime.CompactionWindow)
 	wk.SetNonStreaming(workerRuntime.nonStreaming) // per the task's currently active profile streaming switch (read every turn)
@@ -753,6 +951,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // operation-constraint injection into the worker (configurable, on by default)
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
+	pl.SetCLIOptions(cliOpts)
 	pl.SetFindingRecorder(s.evidenceStore())
 	pl.SetCompactionWindowResolver(plannerRuntime.CompactionWindow)
 	pl.SetNonStreaming(plannerRuntime.nonStreaming)
@@ -771,6 +970,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	// default; shadow logs what would be shown, inject appends the block.
 	s.wireTaskLessons(t, wk, pl)
 	main := agent.NewMainAgent(mainRuntime, "task-router", s.m.dir, tx, mainRuntime.CompactionWindow(), s.agentMaxTurns("mainagent"))
+	main.SetCLIOptions(cliOpts)
 	main.SetFindingRecorder(s.evidenceStore())
 	main.SetCompactionWindowResolver(mainRuntime.CompactionWindow)
 	main.SetNonStreaming(mainRuntime.nonStreaming)

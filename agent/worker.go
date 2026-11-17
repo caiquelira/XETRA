@@ -92,6 +92,14 @@ type Worker struct {
 	// the rendered system prompt. Empty = off. It is data, not instructions:
 	// the server renders it from outcome records and sets it before the run.
 	lessonsBlock string
+	cliOpts      *CLIAgentOptions
+}
+
+// SetCLIOptions configures optional headless CLI execution overrides (shared
+// mcpbridge server, usage DB, hook binary override, explicit CLI Config).
+func (w *Worker) SetCLIOptions(opts CLIAgentOptions) {
+	cp := opts
+	w.cliOpts = &cp
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -424,6 +432,10 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// low-value calls. The rest of the SDK default tools (Read/Write/Edit/LS/Bash/Sleep)
 	// are kept as usual.
 	base = append(base, defaultToolsExcept("MultiEdit", "Glob", "Grep")...)
+	expID := explorationID(ts)
+	if expID == 0 {
+		expID = taskID
+	}
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID})
 	tools, def, cleanup := AugmentTools(WithToolQuery(ctx, nodeSummary(intent)), "worker", base)
 	defer cleanup()
@@ -478,11 +490,56 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		}
 	}
 	sysBody += "\n\nStart executing the intent above: do only it, produce only facts, assets, findings, stop when done."
+	tc := taskClockFrom(ctx)
+	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, w.runTimeout)
+	sessionID := WorkerSessionID(expID, intent.ID)
+	ctx = transcript.WithSessionID(ctx, sessionID)
+	intentID := intent.ID
+	emitWrap := func(r db.Activity) {
+		if emit != nil {
+			r.NodeID, r.Worker = &intentID, name
+			emit(r)
+		}
+	}
+	input := overview
+	if strings.TrimSpace(input) == "" {
+		input = "Start executing the intent claimed in system: do only it, produce only facts, assets, findings, stop when done."
+	}
+
+	if cliOpts, ok := resolveCLIAgentOptionsForContext(ctx, w.cliOpts, w.prov); ok {
+		sessionDir := filepath.Join(w.workDir, "cli-sessions")
+		hasHistory := hasCLISession(sessionDir, sessionID)
+		cliInput := formatWorkerUserPrompt(input, requestID, message, hasHistory, false)
+		runCtx, cancel := withOptionalTimeout(ctx, maxDur)
+		defer cancel()
+		_, reason, err := runCLI(runCtx, CLIRunOptions{
+			Config:       cliOpts.Config,
+			SystemPrompt: sysBody + def.FindingGuidance,
+			Prompt:       cliInput,
+			WorkDir:      runDir,
+			ExtraDirs:    taskExtraDirs(w.workDir, taskID),
+			Tools:        cliToolSet(ctx, tools, w.proxyAddr, w.proxyCACert, w.webSearch),
+			Hooks:        hooks,
+			Bridge:       cliOpts.Bridge,
+			HookBin:      cliOpts.HookBin,
+			Env:          proxyEnv(w.proxyAddr, w.proxyCACert),
+			SessionKey:   sessionID,
+			SessionDir:   sessionDir,
+			MaxTurns:     w.turnCap(ctx),
+			WorkerLabel:  "worker",
+			UsagePG:      cliOpts.UsagePG,
+			Emit:         emitWrap,
+		})
+		if isRunTimeout(ctx, runCtx, err) {
+			reason = harness.ReasonTimeout
+			err = nil
+		}
+		return reason, tsx.Writes(), err
+	}
+
 	system, boundary := deferredSystem(sysBody, def)
 	// The task-level deadline (injected via ctx) clamps this run's wall-clock budget +
 	// decides the wrap-up prompt (see taskclock.go).
-	tc := taskClockFrom(ctx)
-	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, w.runTimeout)
 	settle := wrapupSettlement("worker", []string{"Bash"})
 	if tc.DeadlineUnix > 0 {
 		settle = wrapupSettlementForTask("worker", []string{"Bash"}, clamped)
@@ -542,31 +599,13 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	}
 	// The session id is the provider-side identity (session header, usage metering)
 	// with or without persistence; Norma only puts it on ctx when it writes a transcript.
-	opts.SessionID = WorkerSessionID(ts.ID(), intent.ID)
-	ctx = transcript.WithSessionID(ctx, opts.SessionID)
+	opts.SessionID = sessionID
 	if w.tx != nil { // persist raw LLM conversation; one file per worked intent
 		opts.Transcript = w.tx
 	}
-	intentID := intent.ID
-	emitWrap := func(r db.Activity) {
-		if emit != nil {
-			r.NodeID, r.Worker = &intentID, name
-			emit(r)
-		}
-	}
-	// The intent / launch instruction / intent-anchored assets were already delivered
-	// with the system prompt (see the sysBody assembly above). This launch user message
-	// carries only the [global situation overview] — degradable big-picture info, safe
-	// to compact away. In the rare case the overview marshals to empty, fall back to a
-	// launch sentence so the first turn isn't an empty user message.
-	input := overview
-	if strings.TrimSpace(input) == "" {
-		input = "Start executing the intent claimed in system: do only it, produce only facts, assets, findings, stop when done."
-	}
 
 	// Experimental: when on, noa takes over context compression (archives persist under <workDir>/noa/<SessionID>).
-	noaSession := WorkerSessionID(ts.ID(), intent.ID)
-	enableNoa(&opts, w.noaEnabledFn, w.workDir, noaSession, noaWarn(noaSession))
+	enableNoa(&opts, w.noaEnabledFn, w.workDir, sessionID, noaWarn(sessionID))
 	ctx = attachSideCapture(ctx, &opts)
 	s := agentcore.NewSession(opts)
 	defer s.Close() // release the session's background-task manager (temp dir + processes)
@@ -576,6 +615,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// session exists the worker continues from where it left off instead of
 	// restarting from scratch.
 	alreadyRecorded := false
+	hasHistory := false
 	if w.tx != nil {
 		// A corrupt or unreadable transcript stops the run before any model or tool
 		// call. No terminal reason: the engine marks the intent blocked without the
@@ -584,24 +624,12 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 			return "", tsx.Writes(), err
 		}
 		alreadyRecorded = requestID != "" && hasWorkerChatMessage(s.Messages(), requestID)
-		if len(s.Messages()) > 0 && message == "" {
-			seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
-			input = "Continue."
-		} else if len(s.Messages()) > 0 {
+		hasHistory = len(s.Messages()) > 0
+		if hasHistory {
 			seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
 		}
 	}
-	if message != "" {
-		if alreadyRecorded {
-			input = "Continue executing the new intent entered in the previous human conversation. Do not repeat actions already completed."
-		} else if len(s.Messages()) > 0 {
-			input = workerChatMarker(requestID) + "\n[New intent entered via human conversation]\n" + message +
-				"\n\nExecute this human input immediately; after completing it, decide from the context whether the original task needs to continue."
-		} else {
-			input += "\n\n" + workerChatMarker(requestID) + "\n[New intent entered via human conversation]\n" + message +
-				"\n\nExecute this human input first."
-		}
-	}
+	input = formatWorkerUserPrompt(input, requestID, message, hasHistory, alreadyRecorded)
 
 	// Budgets + settlement are owned by the SDK (MaxTurns/MaxDuration + Settlement):
 	// on hit it runs a wrap-up turn and finishes with ReasonMaxTurns/ReasonTimeout.
@@ -611,4 +639,22 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// pause / planner kill / shutdown, which the engine distinguishes and re-queues/stops.
 	_, reason, err := captureRunSession(ctx, s, input, emitWrap)
 	return reason, tsx.Writes(), err
+}
+
+func formatWorkerUserPrompt(input, requestID, message string, hasHistory, alreadyRecorded bool) string {
+	if message == "" {
+		if hasHistory {
+			return "Continue."
+		}
+		return input
+	}
+	if alreadyRecorded {
+		return "Continue executing the new intent entered in the previous human conversation. Do not repeat actions already completed."
+	}
+	if hasHistory {
+		return workerChatMarker(requestID) + "\n[New intent entered via human conversation]\n" + message +
+			"\n\nExecute this human input immediately; after completing it, decide from the context whether the original task needs to continue."
+	}
+	return input + "\n\n" + workerChatMarker(requestID) + "\n[New intent entered via human conversation]\n" + message +
+		"\n\nExecute this human input first."
 }

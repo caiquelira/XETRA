@@ -70,6 +70,37 @@ func (p *Pool) Members() []*Member { return p.members }
 // Head returns the first member of the chain.
 func (p *Pool) Head() *Member { return p.members[0] }
 
+// ActiveMember returns the highest-priority member whose breaker is not open,
+// falling back to the chain head when every member is cooling off.
+func (p *Pool) ActiveMember() *Member {
+	if p == nil || len(p.members) == 0 {
+		return nil
+	}
+	for _, m := range p.members {
+		if !p.health.IsOpen(m.ID) {
+			return m
+		}
+	}
+	return p.members[0]
+}
+
+// Unwrap returns the active member's underlying provider so callers (such as
+// headless CLI option resolution) can inspect the currently selected backend.
+func (p *Pool) Unwrap() llm.Provider {
+	if m := p.ActiveMember(); m != nil {
+		return m.Prov
+	}
+	return nil
+}
+
+// Health returns the shared circuit-breaker registry backing this pool.
+func (p *Pool) Health() *Registry {
+	if p == nil {
+		return nil
+	}
+	return p.health
+}
+
 // Stream implements llm.Provider with failover.
 //
 // The one hard rule: a member may only be abandoned BEFORE it has yielded any
@@ -252,11 +283,14 @@ func shouldFailover(ctx context.Context, err error) bool {
 // keep failing until a human fixes it) rather than transient. Hard failures open
 // the breaker on the first occurrence.
 func isHardFailure(err error) bool {
+	if err == nil {
+		return false
+	}
 	switch statusOf(err) {
 	case 401, 402, 403, 404:
 		return true
 	}
-	return false
+	return strings.Contains(err.Error(), "CLI quota exhausted:")
 }
 
 // trimErr shortens an error for logs/UI — provider bodies can be long.

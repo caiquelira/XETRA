@@ -51,8 +51,8 @@ func WithWorker(ctx context.Context, worker string) context.Context {
 	return context.WithValue(ctx, workerContextKey{}, worker)
 }
 
-// workerFrom returns the explicit lane override, or "" when none is set.
-func workerFrom(ctx context.Context) string {
+// WorkerFrom returns the explicit lane override, or "" when none is set.
+func WorkerFrom(ctx context.Context) string {
 	if ctx == nil {
 		return ""
 	}
@@ -67,6 +67,15 @@ type usageSinkContextKey struct{}
 // The task runtime uses it to meter run budgets.
 func WithUsageSink(ctx context.Context, sink func(llm.Usage)) context.Context {
 	return context.WithValue(ctx, usageSinkContextKey{}, sink)
+}
+
+// UsageSinkFrom returns the usage metering callback attached to ctx, or nil.
+func UsageSinkFrom(ctx context.Context) func(llm.Usage) {
+	if ctx == nil {
+		return nil
+	}
+	sink, _ := ctx.Value(usageSinkContextKey{}).(func(llm.Usage))
+	return sink
 }
 
 // Recorder wraps an llm.Provider and records every completion call.
@@ -95,6 +104,15 @@ func Wrap(inner llm.Provider, pg *db.DB, model, profName, thinkingType, reasonin
 	}
 }
 
+// Unwrap returns the wrapped llm.Provider so callers can inspect concrete
+// implementations (such as CLI completion providers) beneath recording wrappers.
+func (r *Recorder) Unwrap() llm.Provider {
+	if r == nil {
+		return nil
+	}
+	return r.inner
+}
+
 // parseSession extracts task id and worker role from session strings like
 // "exp1-worker-i3" → ("1", "worker") or "exp2-planner" → ("2", "planner").
 func parseSession(s string) (taskID, worker string) {
@@ -119,6 +137,26 @@ func parseSession(s string) (taskID, worker string) {
 	return taskID, worker
 }
 
+func resolveCallMeta(ctx context.Context, workerOverride string) (session, taskID string, expID int64, worker string) {
+	session = transcript.SessionIDFrom(ctx)
+	parsedID, parsedWorker := parseSession(session)
+	expID = db.ParseExpID(parsedID)
+	taskID = TaskIDFrom(ctx)
+	if taskID == "" {
+		// Backward compatibility for non-task callers. For task calls, the task
+		// runtime always supplies the registry id explicitly.
+		taskID = parsedID
+	}
+	worker = strings.TrimSpace(workerOverride)
+	if worker == "" {
+		worker = WorkerFrom(ctx)
+	}
+	if worker == "" {
+		worker = parsedWorker
+	}
+	return session, taskID, expID, worker
+}
+
 // Stream implements llm.Provider. It delegates to the inner provider, accumulates
 // the streamed events to reconstruct the response, and records the full exchange.
 //
@@ -132,18 +170,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 	// gated. Only body serialization + response accumulation are skipped when off.
 	recordBodies := r.enabled == nil || r.enabled()
 	start := time.Now()
-	session := transcript.SessionIDFrom(ctx)
-	parsedID, worker := parseSession(session)
-	if ov := workerFrom(ctx); ov != "" {
-		worker = ov
-	}
-	expID := db.ParseExpID(parsedID)
-	taskID := TaskIDFrom(ctx)
-	if taskID == "" {
-		// Backward compatibility for non-task callers. For task calls, the task
-		// runtime always supplies the registry id explicitly.
-		taskID = parsedID
-	}
+	session, taskID, expID, worker := resolveCallMeta(ctx, "")
 
 	// Serialize the request only when storing bodies (this is the expensive part).
 	// Alongside it, attach a Capture so the HTTP transport can hand back the
@@ -152,9 +179,16 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 	// SSE framing is already decoded). See capture.go.
 	reqBody := ""
 	var capt *Capture
+	innerCtx := ctx
 	if recordBodies {
 		reqBody = r.serializeRequest(req)
-		ctx, capt = NewCapture(ctx)
+		innerCtx, capt = NewCapture(innerCtx)
+	}
+	// Strip the outer UsageSink when invoking inner so a CLI-backed inner
+	// provider (which invokes RecordCLIUsage itself) does not double-meter the
+	// same call into budgets. Recorder writes the single metered usage below.
+	if UsageSinkFrom(innerCtx) != nil {
+		innerCtx = WithUsageSink(innerCtx, nil)
 	}
 
 	return func(yield func(llm.StreamEvent, error) bool) {
@@ -185,7 +219,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 		}
 		defer func() { finish(ctx.Err()) }()
 
-		for ev, err := range r.inner.Stream(ctx, req) {
+		for ev, err := range r.inner.Stream(innerCtx, req) {
 			if err != nil {
 				streamErr = err
 				finish(streamErr)
@@ -232,25 +266,20 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
 	recordBodies := r.enabled == nil || r.enabled()
 	start := time.Now()
-	session := transcript.SessionIDFrom(ctx)
-	parsedID, worker := parseSession(session)
-	if ov := workerFrom(ctx); ov != "" {
-		worker = ov
-	}
-	expID := db.ParseExpID(parsedID)
-	taskID := TaskIDFrom(ctx)
-	if taskID == "" {
-		taskID = parsedID
-	}
+	session, taskID, expID, worker := resolveCallMeta(ctx, "")
 
 	reqBody := ""
 	var capt *Capture
+	innerCtx := ctx
 	if recordBodies {
 		reqBody = r.serializeRequest(req)
-		ctx, capt = NewCapture(ctx)
+		innerCtx, capt = NewCapture(innerCtx)
+	}
+	if UsageSinkFrom(innerCtx) != nil {
+		innerCtx = WithUsageSink(innerCtx, nil)
 	}
 
-	msg, stopReason, usage, err := r.inner.Complete(ctx, req)
+	msg, stopReason, usage, err := r.inner.Complete(innerCtx, req)
 	status := "ok"
 	if err != nil {
 		status = "error"
@@ -277,22 +306,35 @@ func thinkingText(msg llm.Message) string {
 // usage sink (if any) sees these calls even when no PostgreSQL recorder is set
 // (r.pg == nil), so a budget also counts calls that are not persisted.
 func (r *Recorder) recordUsage(ctx context.Context, taskID string, expID int64, worker string, usage llm.Usage, latencyMs int, status string) {
-	if r.model == "" && usage.InputTokens == 0 && usage.OutputTokens == 0 &&
+	writeUsage(ctx, r.pg, taskID, expID, worker, r.model, r.prof, usage, latencyMs, status)
+}
+
+// RecordCLIUsage triggers any budget UsageSink attached to ctx and appends a
+// metering row to llm_usage (when pg is non-nil) for a headless CLI invocation.
+// Worker attribution prefers workerOverride, then WorkerFrom(ctx), then the role
+// parsed from transcript.SessionIDFrom(ctx).
+func RecordCLIUsage(ctx context.Context, pg *db.DB, model, profileName, workerOverride string, usage llm.Usage, latencyMs int, status string) {
+	_, taskID, expID, worker := resolveCallMeta(ctx, workerOverride)
+	writeUsage(ctx, pg, taskID, expID, worker, model, profileName, usage, latencyMs, status)
+}
+
+func writeUsage(ctx context.Context, pg *db.DB, taskID string, expID int64, worker, model, profileName string, usage llm.Usage, latencyMs int, status string) {
+	if model == "" && usage.InputTokens == 0 && usage.OutputTokens == 0 &&
 		usage.CacheReadTokens == 0 && usage.CacheWriteTokens == 0 {
 		return
 	}
-	if sink, _ := ctx.Value(usageSinkContextKey{}).(func(llm.Usage)); sink != nil {
+	if sink := UsageSinkFrom(ctx); sink != nil {
 		sink(usage)
 	}
-	if r.pg == nil {
+	if pg == nil {
 		return
 	}
-	err := r.pg.InsertLLMUsage(&db.LLMUsage{
+	err := pg.InsertLLMUsage(&db.LLMUsage{
 		TaskID:        taskID,
 		ExplorationID: expID,
 		Worker:        worker,
-		Model:         r.model,
-		ProfileName:   r.prof,
+		Model:         model,
+		ProfileName:   profileName,
 		LatencyMs:     latencyMs,
 		InputTokens:   usage.InputTokens,
 		OutputTokens:  usage.OutputTokens,

@@ -18,6 +18,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/config"
+	"github.com/Autumn-27/artex/mcpbridge"
 	"github.com/Autumn-27/artex/server"
 )
 
@@ -48,6 +49,27 @@ func main() {
 }
 
 func run() int {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "hook":
+			sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			if err := mcpbridge.RunHookClient(sigCtx, os.Args[2:], os.Stdin, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "artex hook: %v\n", err)
+				return 1
+			}
+			return 0
+		case "mcp-bridge":
+			sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			if err := mcpbridge.RunStdioBridge(sigCtx, os.Args[2:], os.Stdin, os.Stdout); err != nil {
+				fmt.Fprintf(os.Stderr, "artex mcp-bridge: %v\n", err)
+				return 1
+			}
+			return 0
+		}
+	}
+
 	var (
 		addr    = flag.String("addr", "127.0.0.1:8787", "HTTP listen address")
 		dataDir = flag.String("data", filepath.Join(config.BaseDir(), "data"), "runtime data directory: traffic index, task files, transcripts (default: data/ next to the executable)")
@@ -110,6 +132,7 @@ func run() int {
 		log.Printf("[config] trusted proxies: %v", trusted)
 	}
 	srv := server.New(ctx, mgr, skillDir, *dataDir, keyDir, server.WithSecretScrub(), server.WithTrustedProxies(trusted))
+	defer func() { _ = srv.Close() }()
 	httpSrv := &http.Server{
 		Addr:              *addr,
 		Handler:           srv.Handler(),
@@ -130,6 +153,7 @@ func run() int {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
+	_ = srv.Close()
 	return 0
 }
 

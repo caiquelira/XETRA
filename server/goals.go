@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -386,10 +387,54 @@ func (s *Server) createGoals(ctx context.Context, t *Task, emit func(db.Activity
 		as = s.m.Assets()
 	}
 	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
-	s.engine.BeginLLMCall(t.ID)
 	goalRuntime := s.agentsForTask(t).runtime
-	decomposed := agent.DecomposeGoalsWithProvider(ctx, goalRuntime, s.m.dir, t.Goal, t.Description, as, t.Store, taskID, goalRuntime.nonStreaming(), goalRuntime.maxTokens(), emit)
-	s.engine.EndLLMCall(t.ID)
+	var decomposed []agent.GoalSpec
+	const maxCLIFailovers = 16
+	for failover := 0; failover < maxCLIFailovers; failover++ {
+		snap := beginCLIAttempt(ctx, goalRuntime)
+		var lastResultErr string
+		wrappedEmit := emit
+		if snap != nil {
+			wrappedEmit = func(a db.Activity) {
+				if a.Kind == "result" && a.IsError {
+					if d := strings.TrimSpace(a.Detail); d != "" {
+						lastResultErr = d
+					} else if d := strings.TrimSpace(a.Summary); d != "" {
+						lastResultErr = d
+					}
+				}
+				if emit != nil {
+					emit(a)
+				}
+			}
+		}
+		if s.engine != nil {
+			s.engine.BeginLLMCall(t.ID)
+		}
+		if cfg, isCLI := goalRuntime.ResolveCLIConfig(ctx); isCLI {
+			decomposed = agent.DecomposeGoalsWithCLI(ctx, agent.CLIAgentOptions{
+				Bridge:  s.ensureMCPBridge(),
+				UsagePG: s.usagePG(),
+				Config:  cfg,
+			}, s.m.dir, t.Goal, t.Description, as, t.Store, taskID, wrappedEmit)
+		} else {
+			decomposed = agent.DecomposeGoalsWithProvider(ctx, goalRuntime, s.m.dir, t.Goal, t.Description, as, t.Store, taskID, goalRuntime.nonStreaming(), goalRuntime.maxTokens(), wrappedEmit)
+		}
+		if s.engine != nil {
+			s.engine.EndLLMCall(t.ID)
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		if snap != nil && len(decomposed) == 0 && lastResultErr != "" {
+			if retry, _ := finishCLIAttempt(snap, false, errors.New(lastResultErr)); retry {
+				continue
+			}
+		} else if snap != nil {
+			_, _ = finishCLIAttempt(snap, len(decomposed) > 0, nil)
+		}
+		break
+	}
 	for _, g := range decomposed {
 		if strings.TrimSpace(g.Text) != "" {
 			specs = append(specs, goalSpec{Text: g.Text, VulnClass: g.VulnClass})

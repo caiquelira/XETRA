@@ -94,6 +94,9 @@ type Config struct {
 	// global policy → built-in default, resolved server-side). See RetryConfig for
 	// the per-layer semantics; zero values = fully inherit the built-in defaults.
 	Retry RetryConfig
+	// ProfileName is the optional LLM profile name carried for usage metering
+	// when running via CLI providers or recorders.
+	ProfileName string
 }
 
 // RetryConfig holds the retry parameters that travel with one LLM config. The
@@ -168,9 +171,14 @@ func normalizeOllamaBaseURL(raw string) string {
 	return b
 }
 
+// IsCLI reports whether this config targets a registered local CLI backend
+// (such as claude-cli or agy-cli).
+func (c Config) IsCLI() bool { return IsCLIFormat(c.Format) }
+
 // NeedsAPIKey reports whether this provider format requires an API key to be
-// usable. Ollama (local server) is keyless; every cloud format needs one.
-func (c Config) NeedsAPIKey() bool { return c.Format != FormatOllama }
+// usable. Ollama (local server) and local CLI backends are keyless; every cloud
+// HTTP format needs one.
+func (c Config) NeedsAPIKey() bool { return c.Format != FormatOllama && !c.IsCLI() }
 
 // CompactionWindow returns the model context window in TOKENS for compaction
 // thresholds, resolved from the user-configured size (ContextWindowK). 0/unset →
@@ -201,11 +209,11 @@ func compactionConfig(windowTokens int) *compaction.Config {
 
 // FromEnv resolves the LLM provider config:
 //
-//	ARTEX_LLM_PROVIDER = anthropic|openai|openai-responses|ollama (default: inferred from keys)
+//	ARTEX_LLM_PROVIDER = anthropic|openai|openai-responses|ollama|claude-cli|agy-cli (default: inferred from keys)
 //	ARTEX_LLM_MODEL    = model id        (default: per provider)
-//	ARTEX_LLM_BASE_URL = endpoint        (optional; ollama defaults to localhost:11434/v1)
+//	ARTEX_LLM_BASE_URL = endpoint        (optional; ollama defaults to localhost:11434/v1; CLI binary path override for claude-cli/agy-cli)
 //	ARTEX_LLM_PROXY    = proxy URL        (optional; http/https/socks5)
-//	ANTHROPIC_API_KEY / OPENAI_API_KEY         = credentials (unused for ollama)
+//	ANTHROPIC_API_KEY / OPENAI_API_KEY         = credentials (unused for ollama / CLI)
 func FromEnv() (Config, bool) {
 	// Case- and space-insensitive: "Ollama" used to miss every case below and
 	// fall through to anthropic, sending ANTHROPIC_API_KEY to the Ollama base URL.
@@ -255,6 +263,16 @@ func FromEnv() (Config, bool) {
 		if c.Model == "" {
 			c.Model = "llama3.2"
 		}
+	case "claude-cli":
+		c.Format = FormatClaudeCLI
+		if c.Model == "" {
+			c.Model = claudeDefaultModel
+		}
+	case "agy-cli":
+		c.Format = FormatAgyCLI
+		if c.Model == "" {
+			c.Model = agyDefaultModel
+		}
 	default:
 		c.Format = llm.FormatAnthropic
 		c.APIKey = anthKey
@@ -281,7 +299,7 @@ func ConfigFrom(provider, model, baseURL, apiKey, proxy string) Config {
 		Proxy:   strings.TrimSpace(proxy),
 		Stream:  true, // streaming by default; the caller overrides per profile
 	}
-	switch strings.TrimSpace(provider) {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "openai":
 		c.Format = llm.FormatOpenAI
 		// provider appends "/chat/completions"; tolerate a full endpoint URL.
@@ -306,6 +324,16 @@ func ConfigFrom(provider, model, baseURL, apiKey, proxy string) Config {
 		if c.Model == "" {
 			c.Model = "llama3.2"
 		}
+	case "claude-cli":
+		c.Format = FormatClaudeCLI
+		if c.Model == "" {
+			c.Model = claudeDefaultModel
+		}
+	case "agy-cli":
+		c.Format = FormatAgyCLI
+		if c.Model == "" {
+			c.Model = agyDefaultModel
+		}
 	default:
 		c.Format = llm.FormatAnthropic
 		// provider appends "/v1/messages".
@@ -328,7 +356,7 @@ func isFalsy(s string) bool {
 }
 
 // Provider returns the short provider name
-// ("anthropic"/"openai"/"openai-responses"/"ollama").
+// ("anthropic"/"openai"/"openai-responses"/"ollama"/"claude-cli"/"agy-cli").
 func (c Config) Provider() string {
 	switch c.Format {
 	case llm.FormatOpenAI:
@@ -337,6 +365,10 @@ func (c Config) Provider() string {
 		return "openai-responses"
 	case FormatOllama:
 		return "ollama"
+	case FormatClaudeCLI:
+		return "claude-cli"
+	case FormatAgyCLI:
+		return "agy-cli"
 	}
 	return "anthropic"
 }
@@ -345,6 +377,16 @@ func (c Config) Provider() string {
 // limiter lives on the single provider instance — so planner + all workers +
 // main agent (which share this provider) are bounded by one shared rate limit.
 func (c Config) NewProvider() (llm.Provider, error) {
+	if c.IsCLI() {
+		b, ok := LookupCLIBackend(c.Format)
+		if !ok {
+			return nil, fmt.Errorf("llm: unknown CLI backend %q", c.Format)
+		}
+		if err := b.CheckReady(c); err != nil {
+			return nil, err
+		}
+		return newCLICompletionProvider(b, c), nil
+	}
 	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey, c.UserAgent)
 	if err != nil {
 		return nil, err
@@ -568,6 +610,11 @@ func ValidateUserAgent(raw string) (string, error) {
 // just the collapsed ok/err the UI shows. Bodies are clipped to keep a chatty
 // SSE stream from flooding the log.
 func logTestConnection(c Config, capt *llmrec.Capture) {
+	if c.IsCLI() {
+		log.Printf("[llm-test] %s / %s @ %s — completed via local CLI backend",
+			c.Provider(), c.Model, c.BaseURL)
+		return
+	}
 	attempts := capt.Attempts()
 	if len(attempts) == 0 {
 		log.Printf("[llm-test] %s / %s @ %s — no HTTP request was ever sent (config resolution or connection setup failed)",
@@ -602,7 +649,11 @@ func TestConnection(ctx context.Context, c Config) (time.Duration, string, error
 	if err != nil {
 		return 0, "", err
 	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	timeout := 30 * time.Second
+	if c.IsCLI() {
+		timeout = 45 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	// Capture the raw wire messages: what a connection test most needs to see is
 	// exactly what the gateway returned (status code + response body), which is gone

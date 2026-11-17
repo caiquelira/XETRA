@@ -150,3 +150,93 @@ FROM llm_usage WHERE profile_name=$1`, profile).Scan(&count, &input, &output, &w
 		}
 	}
 }
+
+func TestUsageRecordCLIAndHelpers(t *testing.T) {
+	if UsageSinkFrom(nil) != nil || UsageSinkFrom(context.Background()) != nil {
+		t.Fatal("expected nil UsageSinkFrom on empty/nil context")
+	}
+	if WorkerFrom(nil) != "" || WorkerFrom(context.Background()) != "" {
+		t.Fatal("expected empty WorkerFrom on empty/nil context")
+	}
+
+	var sinkCalls []llm.Usage
+	ctx := WithUsageSink(context.Background(), func(u llm.Usage) {
+		sinkCalls = append(sinkCalls, u)
+	})
+	ctx = WithWorker(ctx, " judge ")
+	ctx = WithTaskID(ctx, "99")
+	ctx = transcript.WithSessionID(ctx, "exp12-worker-i3")
+
+	if UsageSinkFrom(ctx) == nil {
+		t.Fatal("expected non-nil UsageSinkFrom")
+	}
+	if got := WorkerFrom(ctx); got != "judge" {
+		t.Fatalf("WorkerFrom() = %q, want judge", got)
+	}
+
+	// Zero-token call with empty model is skipped.
+	RecordCLIUsage(ctx, nil, "", "cli-prof", "", llm.Usage{}, 10, "ok")
+	if len(sinkCalls) != 0 {
+		t.Fatalf("expected empty model + zero usage to be skipped, got %+v", sinkCalls)
+	}
+
+	// Non-empty usage triggers sink even when pg is nil.
+	u := llm.Usage{InputTokens: 120, OutputTokens: 45, CacheReadTokens: 30}
+	RecordCLIUsage(ctx, nil, "sonnet", "cli-prof", "worker", u, 250, "ok")
+	if len(sinkCalls) != 1 || sinkCalls[0] != u {
+		t.Fatalf("sinkCalls = %+v, want [%+v]", sinkCalls, u)
+	}
+
+	// Verify resolveCallMeta precedence: workerOverride > WorkerFrom > parsed session.
+	_, taskID, expID, worker := resolveCallMeta(ctx, "custom-lane")
+	if taskID != "99" || expID != 12 || worker != "custom-lane" {
+		t.Fatalf("resolveCallMeta(override) = (%q, %d, %q)", taskID, expID, worker)
+	}
+	_, taskID, expID, worker = resolveCallMeta(ctx, "")
+	if taskID != "99" || expID != 12 || worker != "judge" {
+		t.Fatalf("resolveCallMeta(ctx worker) = (%q, %d, %q)", taskID, expID, worker)
+	}
+	baseSessionCtx := transcript.WithSessionID(context.Background(), "exp15-planner")
+	_, taskID, expID, worker = resolveCallMeta(baseSessionCtx, "")
+	if taskID != "15" || expID != 15 || worker != "planner" {
+		t.Fatalf("resolveCallMeta(session fallback) = (%q, %d, %q)", taskID, expID, worker)
+	}
+
+	// Verify Recorder clears inner UsageSink so a CLI-backed inner provider does not double-meter.
+	var wrappedCalls []llm.Usage
+	wrapCtx := WithUsageSink(context.Background(), func(u llm.Usage) {
+		wrappedCalls = append(wrappedCalls, u)
+	})
+	inner := sinkAwareProvider{}
+	rec := Wrap(inner, nil, "sonnet", "cli-prof", "", "", func() bool { return false })
+	for _, err := range rec.Stream(wrapCtx, llm.CompletionRequest{}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, _, err := rec.Complete(wrapCtx, llm.CompletionRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(wrappedCalls) != 2 {
+		t.Fatalf("expected exactly 2 sink calls (one Stream, one Complete), got %d: %+v", len(wrappedCalls), wrappedCalls)
+	}
+}
+
+type sinkAwareProvider struct{}
+
+func (sinkAwareProvider) Stream(ctx context.Context, _ llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	return func(yield func(llm.StreamEvent, error) bool) {
+		u := llm.Usage{InputTokens: 10, OutputTokens: 4}
+		RecordCLIUsage(ctx, nil, "sonnet", "cli-prof", "", u, 1, "ok")
+		if !yield(llm.StreamEvent{Type: llm.SEMessageDelta, StopReason: "end_turn", Usage: u}, nil) {
+			return
+		}
+		yield(llm.StreamEvent{Type: llm.SEMessageStop}, nil)
+	}
+}
+
+func (sinkAwareProvider) Complete(ctx context.Context, _ llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	u := llm.Usage{InputTokens: 11, OutputTokens: 5}
+	RecordCLIUsage(ctx, nil, "sonnet", "cli-prof", "", u, 1, "ok")
+	return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("ok")}}, "end_turn", u, nil
+}
