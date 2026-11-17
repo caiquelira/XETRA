@@ -24,6 +24,7 @@ import (
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -922,7 +923,10 @@ func (m *Manager) targetGateEndpoints() []string {
 	var out []string
 	profiles, _ := m.pg.ListProfiles()
 	for _, p := range profiles {
-		out = append(out, p.BaseURL, p.Proxy)
+		if !agent.IsCLIFormat(llm.Format(p.Format)) {
+			out = append(out, p.BaseURL)
+		}
+		out = append(out, p.Proxy)
 	}
 	on, backend, _, _, searchProxy := m.WebSearch()
 	if on {

@@ -104,6 +104,15 @@ func Wrap(inner llm.Provider, pg *db.DB, model, profName, thinkingType, reasonin
 	}
 }
 
+// Unwrap returns the wrapped llm.Provider so callers can inspect concrete
+// implementations (such as CLI completion providers) beneath recording wrappers.
+func (r *Recorder) Unwrap() llm.Provider {
+	if r == nil {
+		return nil
+	}
+	return r.inner
+}
+
 // parseSession extracts task id and worker role from session strings like
 // "exp1-worker-i3" → ("1", "worker") or "exp2-planner" → ("2", "planner").
 func parseSession(s string) (taskID, worker string) {

@@ -147,6 +147,15 @@ type boundProvider struct {
 // Bind belongs immediately around a concrete provider, inside any routing pool.
 func Bind(inner llm.Provider, model Model) llm.Provider { return &boundProvider{inner, model} }
 
+// Unwrap returns the wrapped provider so callers can inspect underlying
+// implementations (such as CLI completion providers) beneath side-question bindings.
+func (p *boundProvider) Unwrap() llm.Provider {
+	if p == nil {
+		return nil
+	}
+	return p.inner
+}
+
 func (p *boundProvider) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
 	return func(yield func(llm.StreamEvent, error) bool) {
 		c, _ := ctx.Value(attemptKey{}).(*Capture)
