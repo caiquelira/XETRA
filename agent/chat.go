@@ -9,7 +9,9 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/agentcore"
+	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
@@ -32,9 +34,17 @@ type ChatAgent struct {
 	proxyCACert    string
 	webSearch      WebSearchOpts
 	guard          *guard.Guard // optional; nil disables intercept hooks for chat
-	nonStreamingFn func() bool  // resolver: use non-streaming (Complete) path? (nil = streaming)
-	noaEnabledFn   func() bool  // resolver: use experimental noa compaction? (nil = off)
-	maxTokensFn    func() int   // resolver: per-reply output cap (nil/0 = send no cap)
+	nonStreamingFn func() bool // resolver: use non-streaming (Complete) path? (nil = streaming)
+	noaEnabledFn   func() bool // resolver: use experimental noa compaction? (nil = off)
+	maxTokensFn    func() int  // resolver: per-reply output cap (nil/0 = send no cap)
+	cliOpts        *CLIAgentOptions
+}
+
+// SetCLIOptions configures optional headless CLI execution overrides (shared
+// mcpbridge server, usage DB, hook binary override, explicit CLI Config).
+func (c *ChatAgent) SetCLIOptions(opts CLIAgentOptions) {
+	cp := opts
+	c.cliOpts = &cp
 }
 
 func NewChatAgent(prov llm.Provider, model, workDir string, tx *transcript.Store, window int) *ChatAgent {
@@ -127,6 +137,48 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	ctx = WithRunInfo(ctx, RunInfo{SessionID: sessionID})
 	tools, def, cleanup := AugmentTools(ctx, agentKey, base)
 	defer cleanup()
+	ctx = transcript.WithSessionID(ctx, sessionID)
+	emitChat := func(r db.Activity) {
+		if emit != nil {
+			r.Worker = agentKey
+			emit(r)
+		}
+	}
+
+	if cliOpts, ok := resolveCLIAgentOptionsForContext(ctx, c.cliOpts, c.prov); ok {
+		sysBody := chatSystem(agentKey, c.workDir, sessionWorkDir) + def.FindingGuidance
+		var hooks harness.HookRunner
+		if c.guard != nil {
+			hooks = c.guard.Hooks()
+		}
+		workerLabel := llmrec.WorkerFrom(ctx)
+		if workerLabel == "" {
+			workerLabel = "chat"
+		}
+		runCtx, cancel := withOptionalTimeout(ctx, maxDuration)
+		defer cancel()
+		text, _, err := runCLI(runCtx, CLIRunOptions{
+			Config:       cliOpts.Config,
+			SystemPrompt: sysBody,
+			Prompt:       message,
+			WorkDir:      sessionWorkDir,
+			Tools:        cliToolSet(ctx, tools, c.proxyAddr, c.proxyCACert, ws),
+			Hooks:        hooks,
+			Bridge:       cliOpts.Bridge,
+			HookBin:      cliOpts.HookBin,
+			Env:          proxyEnv(c.proxyAddr, c.proxyCACert),
+			SessionKey:   sessionID,
+			SessionDir:   filepath.Join(c.workDir, "cli-sessions"),
+			MaxTurns:     maxTurns,
+			WorkerLabel:  workerLabel,
+			UsagePG:      cliOpts.UsagePG,
+			Emit:         emitChat,
+		})
+		if isRunTimeout(ctx, runCtx, err) {
+			err = nil
+		}
+		return text, err
+	}
 
 	system, boundary := deferredSystem(chatSystem(agentKey, c.workDir, sessionWorkDir), def)
 	opts := agentcore.Options{
@@ -172,7 +224,6 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	// The session id is the provider-side identity (session header, usage metering)
 	// with or without persistence; Norma only puts it on ctx when it writes a transcript.
 	opts.SessionID = sessionID
-	ctx = transcript.WithSessionID(ctx, opts.SessionID)
 	if c.tx != nil { // persist raw human↔AI conversation; one accumulating file per thread
 		opts.Transcript = c.tx
 	}
@@ -192,11 +243,6 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	// re-unlock skill-gated MCPs from prior Skill() calls in the reloaded history so
 	// revealed tools stay callable across the fresh session.
 	seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
-	text, _, err := captureRunSession(ctx, s, message, func(r db.Activity) {
-		if emit != nil {
-			r.Worker = agentKey
-			emit(r)
-		}
-	})
+	text, _, err := captureRunSession(ctx, s, message, emitChat)
 	return text, err
 }

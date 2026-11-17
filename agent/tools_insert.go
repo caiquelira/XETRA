@@ -346,7 +346,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					continue
 				}
 				results = append(results, result{Index: i, ID: id, Type: typ})
-				t.writes.Assets++
+				t.addWriteAsset()
 				t.anchorOwner(id)
 				if taskID > 0 {
 					var sourceNodeID *int64

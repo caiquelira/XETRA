@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
@@ -34,6 +35,14 @@ type MainAgent struct {
 	nonStreamingFn  func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn    func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn     func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
+	cliOpts         *CLIAgentOptions
+}
+
+// SetCLIOptions configures optional headless CLI execution overrides (shared
+// mcpbridge server, usage DB, hook binary override, explicit CLI Config).
+func (m *MainAgent) SetCLIOptions(opts CLIAgentOptions) {
+	cp := opts
+	m.cliOpts = &cp
 }
 
 // SetNoaEnabled wires a resolver deciding whether runs use the experimental noa
@@ -127,9 +136,52 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	// domain tools + basic default toolset (Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash)
 	// when the asset coverage feature is off, drop add_task_scope/list_untested_assets (not in the prompt).
 	base := append(tsx.DropCoverageTools(tsx.MainAgentTools()), actool.DefaultTools()...)
+	expID := explorationID(ts)
+	if expID == 0 {
+		expID = taskID
+	}
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
 	tools, def, cleanup := AugmentTools(ctx, "mainagent", base)
 	defer cleanup()
+	// Segment 0 keeps the legacy "exp%d-main" name so existing transcripts still
+	// load; each new session (seg>=1) gets its own file for a clean context. The id
+	// is the provider-side identity (session header, usage metering) with or without
+	// persistence; Norma only puts it on ctx when it writes a transcript.
+	sessionID := fmt.Sprintf("exp%d-main", expID)
+	if mainSeg > 0 {
+		sessionID = fmt.Sprintf("exp%d-main-s%d", expID, mainSeg)
+	}
+	ctx = transcript.WithSessionID(ctx, sessionID)
+	emitMain := func(r db.Activity) {
+		if emit != nil {
+			r.Worker = "mainagent"
+			emit(r)
+		}
+	}
+	if cliOpts, ok := resolveCLIAgentOptionsForContext(ctx, m.cliOpts, m.prov); ok {
+		mainWorkDir := ensureRoleRunDir(m.workDir, taskID, "mainagent")
+		ctx = intercept.WithReviewWorkingDirectory(ctx, mainWorkDir)
+		sysBody := mainAgentSystem(goal, m.workDir, mainWorkDir) + def.FindingGuidance
+		text, _, err := runCLI(ctx, CLIRunOptions{
+			Config:       cliOpts.Config,
+			SystemPrompt: sysBody,
+			Prompt:       message,
+			WorkDir:      mainWorkDir,
+			ExtraDirs:    taskExtraDirs(m.workDir, taskID),
+			Tools:        cliToolSet(ctx, tools, m.proxyAddr, m.proxyCACert, m.webSearch),
+			Hooks:        hooks,
+			Bridge:       cliOpts.Bridge,
+			HookBin:      cliOpts.HookBin,
+			Env:          proxyEnv(m.proxyAddr, m.proxyCACert),
+			SessionKey:   sessionID,
+			SessionDir:   filepath.Join(m.workDir, "cli-sessions"),
+			MaxTurns:     m.maxTurns,
+			WorkerLabel:  "main",
+			UsagePG:      cliOpts.UsagePG,
+			Emit:         emitMain,
+		})
+		return text, err
+	}
 	// this task's working directory <workDir>/tasks/<taskID>, created up front.
 	mainDir := ensureRunDir(m.workDir, taskID, 0)
 	ctx = intercept.WithReviewWorkingDirectory(ctx, mainDir)
@@ -169,25 +221,13 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks
 	}
-	// Segment 0 keeps the legacy "exp%d-main" name so existing transcripts still
-	// load; each new session (seg>=1) gets its own file for a clean context. The id
-	// is the provider-side identity (session header, usage metering) with or without
-	// persistence; Norma only puts it on ctx when it writes a transcript.
-	opts.SessionID = fmt.Sprintf("exp%d-main", ts.ID())
-	if mainSeg > 0 {
-		opts.SessionID = fmt.Sprintf("exp%d-main-s%d", ts.ID(), mainSeg)
-	}
-	ctx = transcript.WithSessionID(ctx, opts.SessionID)
-	if m.tx != nil { // persist raw human↔AI conversation; one accumulating file per segment
+	opts.SessionID = sessionID
+	if m.tx != nil { // persist raw human-AI conversation; one accumulating file per segment
 		opts.Transcript = m.tx
 	}
 	// experimental feature: when enabled, noa takes over context compression (archive centralized under <workDir>/noa/<SessionID>, persistent).
 	// the session id follows the same rule as the transcript (segment-aware), keeping archive and resume aligned.
-	noaSession := fmt.Sprintf("exp%d-main", ts.ID())
-	if mainSeg > 0 {
-		noaSession = fmt.Sprintf("exp%d-main-s%d", ts.ID(), mainSeg)
-	}
-	enableNoa(&opts, m.noaEnabledFn, m.workDir, noaSession, noaWarn(noaSession))
+	enableNoa(&opts, m.noaEnabledFn, m.workDir, sessionID, noaWarn(sessionID))
 	ctx = attachSideCapture(ctx, &opts)
 	s := agentcore.NewSession(opts)
 	defer s.Close()
@@ -203,11 +243,6 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	// C2: this session is fresh each turn; re-unlock skill-gated MCPs from prior
 	// Skill() calls in the reloaded history so revealed tools stay callable.
 	seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
-	text, _, err := captureRunSession(ctx, s, message, func(r db.Activity) {
-		if emit != nil {
-			r.Worker = "mainagent"
-			emit(r)
-		}
-	})
+	text, _, err := captureRunSession(ctx, s, message, emitMain)
 	return text, err
 }

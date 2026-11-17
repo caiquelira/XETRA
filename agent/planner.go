@@ -48,8 +48,16 @@ type Planner struct {
 	// planner's multi-step plan survives across wake-ups — each Plan() is a fresh
 	// session, but the shared store lets it record a serial exploit chain once and
 	// dispatch it step-by-step over rounds instead of front-loading it in parallel.
-	todoMu sync.Mutex
-	todos  map[int64]*actool.TodoStore
+	todoMu  sync.Mutex
+	todos   map[int64]*actool.TodoStore
+	cliOpts *CLIAgentOptions
+}
+
+// SetCLIOptions configures optional headless CLI execution overrides (shared
+// mcpbridge server, usage DB, hook binary override, explicit CLI Config).
+func (p *Planner) SetCLIOptions(opts CLIAgentOptions) {
+	cp := opts
+	p.cliOpts = &cp
 }
 
 func NewPlanner(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int) *Planner {
@@ -384,6 +392,13 @@ type triggerLookup struct {
 }
 
 func storeTriggerLookup(ts *db.ExplorationStore) triggerLookup {
+	if ts == nil {
+		return triggerLookup{
+			intentSummary: func(int64) string { return "?" },
+			workerOutput:  func(int64) string { return "" },
+			factIDs:       func(int64) string { return "" },
+		}
+	}
 	return triggerLookup{
 		intentSummary: func(id int64) string { return intentSummary(ts, id) },
 		workerOutput:  func(id int64) string { return workerOutput(ts, id) },
@@ -475,12 +490,18 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	tsx.SetCoverageEnabled(as == nil || as.CoverageEnabled(taskID))
 	tsx.killWork = p.killWork   // enable kill_work tool (nil = unavailable)
 	tsx.steerWork = p.steerWork // enable steer_work tool (nil = unavailable)
-	if origin, _ := ts.OriginFactID(); origin > 0 {
-		tsx.SetOwnerNode(origin) // planner-side anchors default to the task root (origin fact)
+	if ts != nil {
+		if origin, _ := ts.OriginFactID(); origin > 0 {
+			tsx.SetOwnerNode(origin) // planner-side anchors default to the task root (origin fact)
+		}
 	}
 	// Domain tools + the basic default tool set (Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash).
 	// When the asset-coverage feature is off, drop add_task_scope/list_untested_assets (not in the prompt).
 	base := append(tsx.DropCoverageTools(tsx.PlannerTools()), actool.DefaultTools()...)
+	expID := explorationID(ts)
+	if expID == 0 {
+		expID = taskID
+	}
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
 	tools, def, cleanup := AugmentTools(WithToolQuery(ctx, plannerToolQuery(goal, triggers)), "planner", base)
 	defer cleanup()
@@ -510,18 +531,59 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	situational += tsx.coverageLedgerBlock(tc.Final || budgetRound.WrapUp, env)
 	// This task's work dir <workDir>/tasks/<taskID>; create it first.
 	taskDir := ensureRunDir(p.workDir, taskID, 0)
-	ctx = intercept.WithReviewContext(ctx, taskDir, intercept.ReviewBackground{})
-	sysBody := plannerSystem(goal, p.workDir, taskDir) + p.lessonsBlock
 	constraints := ""
 	if p.wantConstraints() {
 		constraints = constraintBlock(ts)
-		sysBody += constraints // inject the operation constraints (if any) into the system prompt, bounding exploration
 	}
+	todoStore := p.todoFor(expID)
+	lead := plannerLeadPrompt(ts, triggers)
+	input := plannerRoundInput(lead, situational, renderPlannerTodos(todoStore.List()), goal, constraints)
+	sessionID := fmt.Sprintf("exp%d-planner", expID)
+	ctx = transcript.WithSessionID(ctx, sessionID)
+	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, 0)
+	emitPlanner := func(r db.Activity) {
+		if emit != nil {
+			r.Worker = "planner" // planner activity has no intent_id (it generates them)
+			emit(r)
+		}
+	}
+
+	if cliOpts, ok := resolveCLIAgentOptionsForContext(ctx, p.cliOpts, p.prov); ok {
+		plannerDir := ensureRoleRunDir(p.workDir, taskID, "planner")
+		ctx = intercept.WithReviewContext(ctx, plannerDir, intercept.ReviewBackground{})
+		sysBody := plannerSystem(goal, p.workDir, plannerDir) + p.lessonsBlock + constraints + def.FindingGuidance
+		cliTools := append(cliToolSet(ctx, tools, p.proxyAddr, p.proxyCACert, p.webSearch), todoStore.Tool())
+		runCtx, cancel := withOptionalTimeout(ctx, maxDur)
+		defer cancel()
+		_, _, err = runCLI(runCtx, CLIRunOptions{
+			Config:       cliOpts.Config,
+			SystemPrompt: sysBody,
+			Prompt:       input,
+			WorkDir:      plannerDir,
+			ExtraDirs:    taskExtraDirs(p.workDir, taskID),
+			Tools:        cliTools,
+			Hooks:        hooks,
+			Bridge:       cliOpts.Bridge,
+			HookBin:      cliOpts.HookBin,
+			Env:          proxyEnv(p.proxyAddr, p.proxyCACert),
+			SessionKey:   "",
+			MaxTurns:     p.maxTurns,
+			WorkerLabel:  "planner",
+			UsagePG:      cliOpts.UsagePG,
+			Emit:         emitPlanner,
+		})
+		if isRunTimeout(ctx, runCtx, err) {
+			err = nil
+		}
+		return tsx.GoalMet, tsx.Reason, err
+	}
+
+	ctx = intercept.WithReviewContext(ctx, taskDir, intercept.ReviewBackground{})
+	sysBody := plannerSystem(goal, p.workDir, taskDir) + p.lessonsBlock + constraints
 	system, boundary := deferredSystem(sysBody, def)
 	// The planner has no wall-clock budget of its own; when a deadline exists, clamp
 	// MaxDuration to the remainder so a running planning round enters wrap-up when the
 	// task hits its deadline (timeout → task-timeout prompt; turns → per-run prompt).
-	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, 0)
 	settle := wrapupSettlement("planner", nil)
 	if tc.DeadlineUnix > 0 {
 		settle = wrapupSettlementForTask("planner", nil, clamped)
@@ -551,7 +613,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		MaxDuration:           maxDur,     // 0=unlimited; with a deadline = time remaining until it
 		Compaction:            compactionConfig(p.compactionWindow()),
 		// Planning todos shared across wake-ups: keep the serial chain across rounds (the session is new; the store isn't).
-		Todos: p.todoFor(ts.ID()),
+		Todos: todoStore,
 		// Hitting [this round's] turn budget → the SDK runs wrap-up: land what this round
 		// has already figured out (dispatch due add_intent, provable prove_goal, record the
 		// serial chain in TodoWrite) rather than stopping planning — the planner keeps
@@ -569,44 +631,29 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	}
 	// The session id is the provider-side identity (session header, usage metering)
 	// with or without persistence; Norma only puts it on ctx when it writes a transcript.
-	opts.SessionID = fmt.Sprintf("exp%d-planner", ts.ID())
-	ctx = transcript.WithSessionID(ctx, opts.SessionID)
+	opts.SessionID = sessionID
 	if p.tx != nil { // persist raw LLM conversation; one accumulating file per task's planner
 		opts.Transcript = p.tx
 	}
 	// Experimental: when on, noa takes over context compression (archives persist under <workDir>/noa/<SessionID>).
-	noaSession := fmt.Sprintf("exp%d-planner", ts.ID())
-	enableNoa(&opts, p.noaEnabledFn, p.workDir, noaSession, noaWarn(noaSession))
-	// The situation (just-finished intents + the full graph) is now spliced into this
-	// round's user input (see input below). The user message also carries the
-	// instruction + cross-wake todos (todos are the model's own planning scratchpad,
-	// regenerable, fine in user).
-	// The opener comes in two flavors depending on "whether this round has concrete
-	// changes": with changes → point at the [actual changes] block below; without
-	// (heartbeat patrol / hint / resume etc.) → don't falsely claim "the graph
-	// changed"; instead prompt to review running intents in passing.
-	lead := "There were concrete changes just now (see [The actual changes that triggered this round] below); plan the next steps accordingly:"
-	if len(triggers) == 0 {
-		lead = "This round is a **scheduled patrol (heartbeat) / no concrete change signal** wake-up — the graph may not have anything new. Review running intents in passing: steer_work the long-stalled or off-track ones to correct course, kill_work the ones whose whole direction is wrong to cut losses; then judge the goals and decide whether to add directions:"
-		// On a heartbeat/no-change wake-up, if the whole graph has no open or running
-		// intent at all → exploration has stalled (no worker running, no queued
-		// direction). Tell the planner explicitly and force it to add new directions
-		// this round, rather than spinning a round after only reviewing running intents.
-		if active, err := ts.HasActiveIntent(); err == nil && !active {
-			lead = "This round is a **scheduled patrol (heartbeat)** wake-up, and there are currently **no open or running intents at all** — no worker is running and no direction is queued; exploration has stalled. You **must** produce one or more new intents this round that advance toward the goal and **don't duplicate** existing ones (producing 0 intents is not allowed); first judge from the situation below whether the goal is met, and if not, add directions immediately:"
-		}
-	}
-	input := plannerRoundInput(lead, situational, renderPlannerTodos(opts.Todos.List()), goal, constraints)
+	enableNoa(&opts, p.noaEnabledFn, p.workDir, sessionID, noaWarn(sessionID))
 	// MaxDuration now interrupts an in-flight tool at the wall-clock deadline and
 	// enters wrap-up in place (on the live ctx), so a stuck single round no longer
 	// bypasses wrap-up — no external hard-ctx backstop needed. ctx carries only
 	// pause / kill / shutdown.
-	_, _, err = captureRun(ctx, opts, input,
-		func(r db.Activity) {
-			if emit != nil {
-				r.Worker = "planner" // planner activity has no intent_id (it generates them)
-				emit(r)
-			}
-		})
+	_, _, err = captureRun(ctx, opts, input, emitPlanner)
 	return tsx.GoalMet, tsx.Reason, err
+}
+
+func plannerLeadPrompt(ts *db.ExplorationStore, triggers []TriggerEvent) string {
+	lead := "There were concrete changes just now (see [The actual changes that triggered this round] below); plan the next steps accordingly:"
+	if len(triggers) == 0 {
+		lead = "This round is a **scheduled patrol (heartbeat) / no concrete change signal** wake-up — the graph may not have anything new. Review running intents in passing: steer_work the long-stalled or off-track ones to correct course, kill_work the ones whose whole direction is wrong to cut losses; then judge the goals and decide whether to add directions:"
+		if ts != nil {
+			if active, err := ts.HasActiveIntent(); err == nil && !active {
+				lead = "This round is a **scheduled patrol (heartbeat)** wake-up, and there are currently **no open or running intents at all** — no worker is running and no direction is queued; exploration has stalled. You **must** produce one or more new intents this round that advance toward the goal and **don't duplicate** existing ones (producing 0 intents is not allowed); first judge from the situation below whether the goal is met, and if not, add directions immediately:"
+			}
+		}
+	}
+	return lead
 }
